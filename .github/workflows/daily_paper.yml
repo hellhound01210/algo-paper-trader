@@ -1,0 +1,36 @@
+name: ORVWB Master v6 Daily Paper Trader
+
+on:
+  schedule:
+    # Runs at 10:05 UTC (15:35 IST) Monday-Friday after NSE market close
+    - cron: '5 10 * * 1-5'
+  workflow_dispatch: # Lets you tap a "Run workflow" button manually anytime on your phone
+
+permissions:
+  contents: write
+
+jobs:
+  run-paper-trader:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ORVWB Master v6 Paper Engine
+        run: python orvwb_bot.py
+
+      - name: Save Updated CSV Ledger to Repository
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add ORVWB_v6_Elite_Ledger.csv
+          git diff --staged --quiet || git commit -m "Auto-update daily paper ledger"
+          git push
