@@ -1,31 +1,83 @@
 import os
+import time
+import urllib.request
+import json
+from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
-import yfinance as yf
+import pyotp
+from SmartApi import SmartConnect
 
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 
-# 7-Stock Engine-A Watchlist (6 Elite + RELIANCE)
+# Mix of BSE and NSE stocks as requested
 WATCHLIST = [
-    "PAYTM.NS",
-    "MCX.NS",
-    "BSE.NS",
-    "HDFCAMC.NS",
-    "LT.NS",
-    "ADANIENT.NS",
-    "RELIANCE.NS",
+    {"symbol": "PAYTM", "exchange": "BSE"},
+    {"symbol": "MCX", "exchange": "BSE"},
+    {"symbol": "BSE", "exchange": "NSE"},
+    {"symbol": "HDFCAMC", "exchange": "NSE"},
+    {"symbol": "LT", "exchange": "NSE"},
+    {"symbol": "ADANIENT", "exchange": "NSE"},
+    {"symbol": "RELIANCE", "exchange": "NSE"},
 ]
 
-PSU_GRINDERS = [
-    "SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"
-]
+PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
 CAPITAL_PER_TRADE = 100000.0
 COMMISSION_PCT = 0.0003
 
 
-def is_engine_a(ticker: str) -> bool:
-    t_up = ticker.upper()
-    return not any(psu in t_up for psu in PSU_GRINDERS)
+def get_angel_session():
+    api_key = os.environ["ANGEL_API_KEY"]
+    client_code = os.environ["ANGEL_CLIENT_CODE"]
+    pin = os.environ["ANGEL_PIN"]
+    totp_secret = os.environ["ANGEL_TOTP_SECRET"]
+
+    smart_api = SmartConnect(api_key=api_key)
+    totp = pyotp.TOTP(totp_secret).now()
+    data = smart_api.generateSession(client_code, pin, totp)
+    if not data.get("status"):
+        raise RuntimeError(f"Angel One Login Failed: {data}")
+    return smart_api
+
+
+def load_token_map():
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    with urllib.request.urlopen(url) as response:
+        scrip_list = json.loads(response.read().decode())
+    return pd.DataFrame(scrip_list)
+
+
+def resolve_token(scrip_df: pd.DataFrame, symbol: str, exchange: str) -> str:
+    if exchange == "NSE":
+        sub = scrip_df[(scrip_df["exch_seg"] == "NSE") & (scrip_df["symbol"] == f"{symbol}-EQ")]
+    else:
+        sub = scrip_df[(scrip_df["exch_seg"] == "BSE") & (scrip_df["name"] == symbol) & (scrip_df["instrumenttype"] == "")]
+        if sub.empty:
+            sub = scrip_df[(scrip_df["exch_seg"] == "BSE") & (scrip_df["symbol"] == symbol)]
+    if sub.empty:
+        raise ValueError(f"Token not found for {symbol} on {exchange}")
+    return str(sub.iloc[0]["token"])
+
+
+def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 30) -> pd.DataFrame:
+    to_date = datetime.now()
+    from_date = to_date - timedelta(days=days_back)
+    params = {
+        "exchange": exchange,
+        "symboltoken": token,
+        "interval": "FIVE_MINUTE",
+        "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
+        "todate": to_date.strftime("%Y-%m-%d 15:30"),
+    }
+    res = smart_api.getCandleData(params)
+    time.sleep(0.4)  # Respect Angel One rate limits
+    if not res.get("status") or not res.get("data"):
+        return pd.DataFrame()
+
+    df = pd.DataFrame(res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+    df.set_index("Timestamp", inplace=True)
+    return df
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -47,23 +99,11 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def simulate_orvwb_v6_for_ticker(ticker: str, days_back: str = "59d") -> list:
-    raw = yf.download(
-        ticker, period=days_back, interval="5m", progress=False, auto_adjust=False
-    )
-    if raw.empty:
+def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
+    if df.empty:
         return []
-
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
-
-    if raw.index.tz is None:
-        raw.index = raw.index.tz_localize("UTC").tz_convert("Asia/Kolkata")
-    else:
-        raw.index = raw.index.tz_convert("Asia/Kolkata")
-
-    df = compute_indicators(raw)
-    use_eng_a = is_engine_a(ticker)
+    df = compute_indicators(df)
+    use_eng_a = not any(psu in symbol.upper() for psu in PSU_GRINDERS)
     engine_name = "Engine A (35/65)" if use_eng_a else "Engine B (2.5R Run)"
     trades = []
 
@@ -91,19 +131,8 @@ def simulate_orvwb_v6_for_ticker(ticker: str, days_back: str = "59d") -> list:
 
         for ts, row in active_bars.iterrows():
             t_str = ts.strftime("%H:%M")
-            c, h, l, o, v = (
-                float(row["Close"]),
-                float(row["High"]),
-                float(row["Low"]),
-                float(row["Open"]),
-                float(row["Volume"]),
-            )
-            atr, vwap, ema20, avg_vol = (
-                float(row["ATR"]),
-                float(row["VWAP"]),
-                float(row["EMA20"]),
-                float(row["AVG_VOL"]),
-            )
+            c, h, l, o, v = float(row["Close"]), float(row["High"]), float(row["Low"]), float(row["Open"]), float(row["Volume"])
+            atr, vwap, ema20, avg_vol = float(row["ATR"]), float(row["VWAP"]), float(row["EMA20"]), float(row["AVG_VOL"])
 
             if np.isnan(atr) or np.isnan(avg_vol) or atr <= 0:
                 continue
@@ -165,14 +194,8 @@ def simulate_orvwb_v6_for_ticker(ticker: str, days_back: str = "59d") -> list:
                     bull_top = ((h - c) / bar_range) <= 0.35
                     bear_bot = ((c - l) / bar_range) <= 0.35
 
-                    long_sig = (
-                        or_valid and has_vol and strong_body and bull_top
-                        and (c > or_high) and (c > vwap) and (c > ema20)
-                    )
-                    short_sig = (
-                        or_valid and has_vol and strong_body and bear_bot
-                        and (c < or_low) and (c < vwap) and (c < ema20)
-                    )
+                    long_sig = or_valid and has_vol and strong_body and bull_top and (c > or_high) and (c > vwap) and (c > ema20)
+                    short_sig = or_valid and has_vol and strong_body and bear_bot and (c < or_low) and (c < vwap) and (c < ema20)
                 else:
                     has_vol = v > (1.20 * avg_vol)
                     long_sig = has_vol and (c > or_high) and (c > vwap)
@@ -180,46 +203,30 @@ def simulate_orvwb_v6_for_ticker(ticker: str, days_back: str = "59d") -> list:
 
                 if long_sig:
                     pos = 1
-                    entry_time = ts.strftime("%H:%M")
+                    entry_time = t_str
                     entry_price = c
-                    if use_eng_a:
-                        raw_sl = min(or_mid - 0.75 * atr, l - 0.30 * atr)
-                        active_stop = min(raw_sl, entry_price - 0.75 * atr)
-                    else:
-                        active_stop = or_low - 1.0 * atr
+                    raw_sl = min(or_mid - 0.75 * atr, l - 0.30 * atr)
+                    active_stop = min(raw_sl, entry_price - 0.75 * atr) if use_eng_a else (or_low - 1.0 * atr)
                     init_risk = max(entry_price - active_stop, 0.05)
                     tp1_price = entry_price + 1.0 * init_risk
                     tp2_price = entry_price + 2.5 * init_risk
-
                 elif short_sig:
                     pos = -1
-                    entry_time = ts.strftime("%H:%M")
+                    entry_time = t_str
                     entry_price = c
-                    if use_eng_a:
-                        raw_sl = max(or_mid + 0.75 * atr, h + 0.30 * atr)
-                        active_stop = max(raw_sl, entry_price + 0.75 * atr)
-                    else:
-                        active_stop = or_high + 1.0 * atr
+                    raw_sl = max(or_mid + 0.75 * atr, h + 0.30 * atr)
+                    active_stop = max(raw_sl, entry_price + 0.75 * atr) if use_eng_a else (or_high + 1.0 * atr)
                     init_risk = max(active_stop - entry_price, 0.05)
                     tp1_price = entry_price - 1.0 * init_risk
                     tp2_price = entry_price - 2.5 * init_risk
 
         if entry_time is not None:
-            if pos != 0:
-                last_c = float(active_bars["Close"].iloc[-1])
-                move = (last_c - entry_price) if pos == 1 else (entry_price - last_c)
-                realized_r += rem_weight * (move / init_risk)
-                exit_price = last_c
-                exit_reason = "OPEN LIVE POSITION"
-
             qty = int(CAPITAL_PER_TRADE // entry_price)
             gross_pnl = realized_r * init_risk * qty
             fees = CAPITAL_PER_TRADE * COMMISSION_PCT * 2
-            net_pnl = round(gross_pnl - fees, 2)
-
             trades.append({
                 "Date": str(trade_date),
-                "Ticker": ticker.replace(".NS", ""),
+                "Ticker": f"{symbol}.{exchange}",
                 "Engine": engine_name,
                 "Side": "LONG" if (tp2_price > entry_price) else "SHORT",
                 "Entry_Time": entry_time,
@@ -228,26 +235,32 @@ def simulate_orvwb_v6_for_ticker(ticker: str, days_back: str = "59d") -> list:
                 "Target_2.5R": round(tp2_price, 2),
                 "Exit_Price": round(exit_price, 2),
                 "Result_R": round(realized_r, 2),
-                "Net_PnL_INR": net_pnl,
+                "Net_PnL_INR": round(gross_pnl - fees, 2),
                 "Status": exit_reason,
             })
     return trades
 
 
 if __name__ == "__main__":
+    smart_api = get_angel_session()
+    scrip_df = load_token_map()
     all_new_trades = []
-    for sym in WATCHLIST:
-        all_new_trades.extend(simulate_orvwb_v6_for_ticker(sym))
+
+    for item in WATCHLIST:
+        sym, exch = item["symbol"], item["exchange"]
+        token = resolve_token(scrip_df, sym, exch)
+        candles = fetch_5m_candles(smart_api, exch, token, days_back=30)
+        all_new_trades.extend(simulate_orvwb_v6(candles, sym, exch))
 
     new_df = pd.DataFrame(all_new_trades)
-
-    if os.path.exists(LEDGER_FILE):
+    if os.path.exists(LEDGER_FILE) and not new_df.empty:
         old_df = pd.read_csv(LEDGER_FILE)
         combined_df = pd.concat([old_df, new_df], ignore_index=True)
-        combined_df.drop_duplicates(subset=["Date", "Ticker"], keep="last", inplace=True)
+        combined_df.drop_duplicates(subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True)
     else:
         combined_df = new_df
 
-    combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
-    combined_df.to_csv(LEDGER_FILE, index=False)
-    print(f"Saved {len(combined_df)} total trades. Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
+    if not combined_df.empty:
+        combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
+        combined_df.to_csv(LEDGER_FILE, index=False)
+        print(f"Processed Angel One BSE/NSE feeds. Total trades: {len(combined_df)}. Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
