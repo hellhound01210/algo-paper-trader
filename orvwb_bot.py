@@ -1,17 +1,14 @@
-# ==============================================================================
-# ORVWB MASTER v6 - BSE WATCHLIST CONFIGURATION (GITHUB / LOCAL)
-# ==============================================================================
 import os
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-LEDGER_FILE = "ORVWB_v6_BSE_Ledger.csv"
+LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 
-# Watchlist using BSE (.BO) feeds for MCX and Paytm alongside the rest
+# Corrected Watchlist: All 7 elite stocks using NSE (.NS) 5-minute feeds
 WATCHLIST = [
-    "PAYTM.BO",     # One 97 Communications (BSE feed)
-    "MCX.BO",       # Multi Commodity Exchange (BSE feed)
+    "PAYTM.NS",     # One 97 Communications
+    "MCX.NS",       # Multi Commodity Exchange
     "BSE.NS",       # BSE Ltd.
     "HDFCAMC.NS",   # HDFC Asset Management
     "LT.NS",        # Larsen & Toubro
@@ -223,7 +220,7 @@ def simulate_orvwb_v6_for_ticker(ticker: str, days_back: str = "59d") -> list:
 
             trades.append({
                 "Date": str(trade_date),
-                "Ticker": ticker.replace(".BO", "").replace(".NS", ""),
+                "Ticker": ticker.replace(".NS", ""),
                 "Engine": engine_name,
                 "Side": "LONG" if (tp2_price > entry_price) else "SHORT",
                 "Entry_Time": entry_time,
@@ -254,4 +251,4 @@ if __name__ == "__main__":
 
     combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
     combined_df.to_csv(LEDGER_FILE, index=False)
-    print(f"Successfully processed BSE/NSE watchlist. Total trades: {len(combined_df)}. Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
+    print(f"Successfully processed watchlist. Total trades: {len(combined_df)}. Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
