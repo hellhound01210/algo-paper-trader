@@ -10,15 +10,15 @@ from SmartApi import SmartConnect
 
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 
-# Mix of BSE and NSE stocks as requested
+# Exact Angel One tokens for BSE (Paytm & MCX) + NSE lookup for the rest
 WATCHLIST = [
-    {"symbol": "PAYTM", "exchange": "BSE"},
-    {"symbol": "MCX", "exchange": "BSE"},
-    {"symbol": "BSE", "exchange": "NSE"},
-    {"symbol": "HDFCAMC", "exchange": "NSE"},
-    {"symbol": "LT", "exchange": "NSE"},
-    {"symbol": "ADANIENT", "exchange": "NSE"},
-    {"symbol": "RELIANCE", "exchange": "NSE"},
+    {"symbol": "PAYTM", "exchange": "BSE", "token": "543396"},
+    {"symbol": "MCX", "exchange": "BSE", "token": "534091"},
+    {"symbol": "BSE", "exchange": "NSE", "token": None},
+    {"symbol": "HDFCAMC", "exchange": "NSE", "token": None},
+    {"symbol": "LT", "exchange": "NSE", "token": None},
+    {"symbol": "ADANIENT", "exchange": "NSE", "token": None},
+    {"symbol": "RELIANCE", "exchange": "NSE", "token": None},
 ]
 
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
@@ -47,15 +47,13 @@ def load_token_map():
     return pd.DataFrame(scrip_list)
 
 
-def resolve_token(scrip_df: pd.DataFrame, symbol: str, exchange: str) -> str:
-    if exchange == "NSE":
-        sub = scrip_df[(scrip_df["exch_seg"] == "NSE") & (scrip_df["symbol"] == f"{symbol}-EQ")]
-    else:
-        sub = scrip_df[(scrip_df["exch_seg"] == "BSE") & (scrip_df["name"] == symbol) & (scrip_df["instrumenttype"] == "")]
-        if sub.empty:
-            sub = scrip_df[(scrip_df["exch_seg"] == "BSE") & (scrip_df["symbol"] == symbol)]
+def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
+    if item.get("token"):
+        return str(item["token"])
+    sym = item["symbol"]
+    sub = scrip_df[(scrip_df["exch_seg"] == "NSE") & (scrip_df["symbol"] == f"{sym}-EQ")]
     if sub.empty:
-        raise ValueError(f"Token not found for {symbol} on {exchange}")
+        raise ValueError(f"Token not found for {sym} on NSE")
     return str(sub.iloc[0]["token"])
 
 
@@ -70,8 +68,9 @@ def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 30) 
         "todate": to_date.strftime("%Y-%m-%d 15:30"),
     }
     res = smart_api.getCandleData(params)
-    time.sleep(0.4)  # Respect Angel One rate limits
+    time.sleep(0.5)
     if not res.get("status") or not res.get("data"):
+        print(f"Warning: No candle data returned for token {token} on {exchange}: {res}")
         return pd.DataFrame()
 
     df = pd.DataFrame(res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
@@ -248,19 +247,17 @@ if __name__ == "__main__":
 
     for item in WATCHLIST:
         sym, exch = item["symbol"], item["exchange"]
-        token = resolve_token(scrip_df, sym, exch)
+        token = resolve_token(scrip_df, item)
+        print(f"Fetching {sym} on {exch} (Token: {token})...")
         candles = fetch_5m_candles(smart_api, exch, token, days_back=30)
-        all_new_trades.extend(simulate_orvwb_v6(candles, sym, exch))
+        sim_trades = simulate_orvwb_v6(candles, sym, exch)
+        print(f" -> Found {len(sim_trades)} trades for {sym}.{exch}")
+        all_new_trades.extend(sim_trades)
 
     new_df = pd.DataFrame(all_new_trades)
-    if os.path.exists(LEDGER_FILE) and not new_df.empty:
-        old_df = pd.read_csv(LEDGER_FILE)
-        combined_df = pd.concat([old_df, new_df], ignore_index=True)
-        combined_df.drop_duplicates(subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True)
+    if not new_df.empty:
+        new_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
+        new_df.to_csv(LEDGER_FILE, index=False)
+        print(f"Saved fresh Angel One ledger! Total trades: {len(new_df)}. Net PnL: INR {new_df['Net_PnL_INR'].sum():,.2f}")
     else:
-        combined_df = new_df
-
-    if not combined_df.empty:
-        combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
-        combined_df.to_csv(LEDGER_FILE, index=False)
-        print(f"Processed Angel One BSE/NSE feeds. Total trades: {len(combined_df)}. Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
+        print("No trades generated across watchlist.")
