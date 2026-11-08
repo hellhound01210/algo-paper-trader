@@ -10,23 +10,33 @@ from SmartApi import SmartConnect
 
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 
-# Exact Angel One tokens for BSE (Paytm & MCX) + NSE lookup for the rest
+# Top Elite Portfolio across BOTH NSE and BSE
 WATCHLIST = [
     {"symbol": "JINDALSTEL", "exchange": "NSE", "token": None},
+    {"symbol": "JINDALSTEL", "exchange": "BSE", "token": None},
     {"symbol": "TRENT", "exchange": "NSE", "token": None},
+    {"symbol": "TRENT", "exchange": "BSE", "token": None},
     {"symbol": "ADANIENT", "exchange": "NSE", "token": None},
+    {"symbol": "ADANIENT", "exchange": "BSE", "token": None},
     {"symbol": "MCX", "exchange": "NSE", "token": None},
     {"symbol": "MCX", "exchange": "BSE", "token": "534091"},
     {"symbol": "RELIANCE", "exchange": "NSE", "token": None},
+    {"symbol": "RELIANCE", "exchange": "BSE", "token": None},
     {"symbol": "INFY", "exchange": "NSE", "token": None},
+    {"symbol": "INFY", "exchange": "BSE", "token": None},
     {"symbol": "HAL", "exchange": "NSE", "token": None},
+    {"symbol": "HAL", "exchange": "BSE", "token": None},
     {"symbol": "BHARTIARTL", "exchange": "NSE", "token": None},
+    {"symbol": "BHARTIARTL", "exchange": "BSE", "token": None},
+    {"symbol": "BAJAJFINSV", "exchange": "NSE", "token": None},
+    {"symbol": "BAJAJFINSV", "exchange": "BSE", "token": None},
     {"symbol": "ICICIBANK", "exchange": "NSE", "token": None},
+    {"symbol": "ICICIBANK", "exchange": "BSE", "token": None},
+    {"symbol": "EICHERMOT", "exchange": "NSE", "token": None},
+    {"symbol": "EICHERMOT", "exchange": "BSE", "token": None},
     {"symbol": "PAYTM", "exchange": "NSE", "token": None},
     {"symbol": "PAYTM", "exchange": "BSE", "token": "543396"},
 ]
-
-
 
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
 CAPITAL_PER_TRADE = 100000.0
@@ -58,13 +68,20 @@ def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
     if item.get("token"):
         return str(item["token"])
     sym = item["symbol"]
-    sub = scrip_df[(scrip_df["exch_seg"] == "NSE") & (scrip_df["symbol"] == f"{sym}-EQ")]
+    exch = item["exchange"]
+    if exch == "NSE":
+        sub = scrip_df[(scrip_df["exch_seg"] == "NSE") & (scrip_df["symbol"] == f"{sym}-EQ")]
+    else:
+        sub = scrip_df[
+            (scrip_df["exch_seg"] == "BSE") &
+            ((scrip_df["name"] == sym) | (scrip_df["symbol"] == sym))
+        ]
     if sub.empty:
-        raise ValueError(f"Token not found for {sym} on NSE")
+        return ""
     return str(sub.iloc[0]["token"])
 
 
-def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 30) -> pd.DataFrame:
+def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 60) -> pd.DataFrame:
     to_date = datetime.now()
     from_date = to_date - timedelta(days=days_back)
     params = {
@@ -75,9 +92,9 @@ def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 30) 
         "todate": to_date.strftime("%Y-%m-%d 15:30"),
     }
     res = smart_api.getCandleData(params)
-    time.sleep(0.5)
+    time.sleep(0.45)
     if not res.get("status") or not res.get("data"):
-        print(f"Warning: No candle data returned for token {token} on {exchange}: {res}")
+        print(f"Warning: No candle data returned for token {token} on {exchange}")
         return pd.DataFrame()
 
     df = pd.DataFrame(res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
@@ -255,8 +272,11 @@ if __name__ == "__main__":
     for item in WATCHLIST:
         sym, exch = item["symbol"], item["exchange"]
         token = resolve_token(scrip_df, item)
+        if not token:
+            print(f"Skipping {sym}.{exch}: Token not found")
+            continue
         print(f"Fetching {sym} on {exch} (Token: {token})...")
-        candles = fetch_5m_candles(smart_api, exch, token, days_back=30)
+        candles = fetch_5m_candles(smart_api, exch, token, days_back=60)
         sim_trades = simulate_orvwb_v6(candles, sym, exch)
         print(f" -> Found {len(sim_trades)} trades for {sym}.{exch}")
         all_new_trades.extend(sim_trades)
