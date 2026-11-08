@@ -10,30 +10,24 @@ from SmartApi import SmartConnect
 
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 
-# Top Elite Portfolio across BOTH NSE and BSE
+# 18-Instrument Optimized Portfolio (All 12 NSE Winners + 6 Profitable BSE Feeds)
 WATCHLIST = [
     {"symbol": "JINDALSTEL", "exchange": "NSE", "token": None},
     {"symbol": "JINDALSTEL", "exchange": "BSE", "token": None},
     {"symbol": "TRENT", "exchange": "NSE", "token": None},
     {"symbol": "TRENT", "exchange": "BSE", "token": None},
     {"symbol": "ADANIENT", "exchange": "NSE", "token": None},
-    {"symbol": "ADANIENT", "exchange": "BSE", "token": None},
     {"symbol": "MCX", "exchange": "NSE", "token": None},
     {"symbol": "MCX", "exchange": "BSE", "token": "534091"},
     {"symbol": "RELIANCE", "exchange": "NSE", "token": None},
     {"symbol": "RELIANCE", "exchange": "BSE", "token": None},
     {"symbol": "INFY", "exchange": "NSE", "token": None},
-    {"symbol": "INFY", "exchange": "BSE", "token": None},
     {"symbol": "HAL", "exchange": "NSE", "token": None},
-    {"symbol": "HAL", "exchange": "BSE", "token": None},
     {"symbol": "BHARTIARTL", "exchange": "NSE", "token": None},
-    {"symbol": "BHARTIARTL", "exchange": "BSE", "token": None},
     {"symbol": "BAJAJFINSV", "exchange": "NSE", "token": None},
     {"symbol": "BAJAJFINSV", "exchange": "BSE", "token": None},
     {"symbol": "ICICIBANK", "exchange": "NSE", "token": None},
-    {"symbol": "ICICIBANK", "exchange": "BSE", "token": None},
     {"symbol": "EICHERMOT", "exchange": "NSE", "token": None},
-    {"symbol": "EICHERMOT", "exchange": "BSE", "token": None},
     {"symbol": "PAYTM", "exchange": "NSE", "token": None},
     {"symbol": "PAYTM", "exchange": "BSE", "token": "543396"},
 ]
@@ -268,6 +262,7 @@ if __name__ == "__main__":
     smart_api = get_angel_session()
     scrip_df = load_token_map()
     all_new_trades = []
+    active_tickers = {f"{item['symbol']}.{item['exchange']}" for item in WATCHLIST}
 
     for item in WATCHLIST:
         sym, exch = item["symbol"], item["exchange"]
@@ -283,8 +278,19 @@ if __name__ == "__main__":
 
     new_df = pd.DataFrame(all_new_trades)
     if not new_df.empty:
-        new_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
-        new_df.to_csv(LEDGER_FILE, index=False)
-        print(f"Saved fresh Angel One ledger! Total trades: {len(new_df)}. Net PnL: INR {new_df['Net_PnL_INR'].sum():,.2f}")
+        if os.path.exists(LEDGER_FILE):
+            old_df = pd.read_csv(LEDGER_FILE)
+            # Filter out removed tickers and merge with new trades cumulatively
+            old_df = old_df[old_df["Ticker"].isin(active_tickers)]
+            combined_df = pd.concat([old_df, new_df], ignore_index=True)
+            combined_df.drop_duplicates(
+                subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True
+            )
+        else:
+            combined_df = new_df
+
+        combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
+        combined_df.to_csv(LEDGER_FILE, index=False)
+        print(f"Saved optimized cumulative ledger! Total trades: {len(combined_df)}. Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
     else:
         print("No trades generated across watchlist.")
