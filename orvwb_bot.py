@@ -12,16 +12,20 @@ LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 
 # Exact Angel One tokens for BSE (Paytm & MCX) + NSE lookup for the rest
 WATCHLIST = [
-    {"symbol": "PAYTM", "exchange": "BSE", "token": "543396"},
-    {"symbol": "PAYTM", "exchange": "NSE", "token": None},
-    {"symbol": "MCX", "exchange": "BSE", "token": "534091"},
-    {"symbol": "MCX", "exchange": "NSE", "token": None},
-    {"symbol": "BSE", "exchange": "NSE", "token": None},
-    {"symbol": "HDFCAMC", "exchange": "NSE", "token": None},
-    {"symbol": "LT", "exchange": "NSE", "token": None},
+    {"symbol": "JINDALSTEL", "exchange": "NSE", "token": None},
+    {"symbol": "TRENT", "exchange": "NSE", "token": None},
     {"symbol": "ADANIENT", "exchange": "NSE", "token": None},
+    {"symbol": "MCX", "exchange": "NSE", "token": None},
+    {"symbol": "MCX", "exchange": "BSE", "token": "534091"},
     {"symbol": "RELIANCE", "exchange": "NSE", "token": None},
+    {"symbol": "INFY", "exchange": "NSE", "token": None},
+    {"symbol": "HAL", "exchange": "NSE", "token": None},
+    {"symbol": "BHARTIARTL", "exchange": "NSE", "token": None},
+    {"symbol": "ICICIBANK", "exchange": "NSE", "token": None},
+    {"symbol": "PAYTM", "exchange": "NSE", "token": None},
+    {"symbol": "PAYTM", "exchange": "BSE", "token": "543396"},
 ]
+
 
 
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
