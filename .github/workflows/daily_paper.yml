@@ -2,9 +2,9 @@ name: ORVWB Master v6 Daily Paper Trader
 
 on:
   schedule:
-    # Runs at 10:05 UTC (15:35 IST) Monday-Friday after NSE market close
+    # Runs at 10:05 UTC (15:35 IST) Monday to Friday
     - cron: '5 10 * * 1-5'
-  workflow_dispatch: # Lets you tap a "Run workflow" button manually anytime on your phone
+  workflow_dispatch: # Lets you tap "Run workflow" manually anytime
 
 permissions:
   contents: write
@@ -22,15 +22,19 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install pandas numpy smartapi-python pyotp logzero websocket-client
 
-      - name: Run ORVWB Master v6 Paper Engine
+      - name: Run ORVWB Master v6 Bot
+        env:
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
+          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
         run: python orvwb_bot.py
 
-      - name: Save Updated CSV Ledger to Repository
+      - name: Commit and push ledger updates
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add ORVWB_v6_Elite_Ledger.csv
-          git diff --staged --quiet || git commit -m "Auto-update daily paper ledger"
-          git push
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update ORVWB v6 paper trading ledger" && git push)
