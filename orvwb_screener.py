@@ -10,16 +10,22 @@ from SmartApi import SmartConnect
 
 SCREENER_FILE = "ORVWB_Screener_Ranked.csv"
 
-# 45 High-Liquidity Momentum & F&O Candidates
+# 45 High-Liquidity Momentum & F&O Candidates (Updated ETERNAL & TMPV tickers)
 CANDIDATE_UNIVERSE = [
     "RELIANCE", "MCX", "PAYTM", "BSE", "ADANIENT", "HDFCAMC", "LT",
-    "ZOMATO", "TRENT", "HAL", "BEL", "DIXON", "POLYCAB", "PERSISTENT",
+    "ETERNAL", "TRENT", "HAL", "BEL", "DIXON", "POLYCAB", "PERSISTENT",
     "COFORGE", "OFSS", "CDSL", "ANGELONE", "MOTILALOFS", "CHOLAFIN",
     "BAJFINANCE", "BAJAJFINSV", "SBIN", "ICICIBANK", "AXISBANK", "INDUSINDBK",
-    "TATAMOTORS", "M&M", "MARUTI", "BAJAJ-AUTO", "TVSMOTOR", "EICHERMOT",
+    "TMPV", "M&M", "MARUTI", "BAJAJ-AUTO", "TVSMOTOR", "EICHERMOT",
     "TATASTEEL", "HINDALCO", "VEDL", "JINDALSTEL", "DLF", "GODREJPROP",
     "SUNPHARMA", "DIVISLAB", "APOLLOHOSP", "TITAN", "BHARTIARTL", "INFY", "TCS"
 ]
+
+# Known exact BSE tokens for special symbol names
+BSE_TOKEN_OVERRIDES = {
+    "PAYTM": "543396",
+    "MCX": "534091",
+}
 
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
 CAPITAL_PER_TRADE = 100000.0
@@ -43,18 +49,26 @@ def load_token_map():
         return pd.DataFrame(json.loads(response.read().decode()))
 
 
-def resolve_nse_token(scrip_df: pd.DataFrame, symbol: str) -> str:
-    sub = scrip_df[(scrip_df["exch_seg"] == "NSE") & (scrip_df["symbol"] == f"{symbol}-EQ")]
+def resolve_token(scrip_df: pd.DataFrame, symbol: str, exchange: str) -> str:
+    if exchange == "NSE":
+        sub = scrip_df[(scrip_df["exch_seg"] == "NSE") & (scrip_df["symbol"] == f"{symbol}-EQ")]
+    else:
+        if symbol in BSE_TOKEN_OVERRIDES:
+            return BSE_TOKEN_OVERRIDES[symbol]
+        sub = scrip_df[
+            (scrip_df["exch_seg"] == "BSE") &
+            ((scrip_df["name"] == symbol) | (scrip_df["symbol"] == symbol))
+        ]
     if sub.empty:
         return ""
     return str(sub.iloc[0]["token"])
 
 
-def fetch_5m_candles(smart_api, token: str, days_back: int = 60) -> pd.DataFrame:
+def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 60) -> pd.DataFrame:
     to_date = datetime.now()
     from_date = to_date - timedelta(days=days_back)
     params = {
-        "exchange": "NSE",
+        "exchange": exchange,
         "symboltoken": token,
         "interval": "FIVE_MINUTE",
         "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
@@ -90,7 +104,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def simulate_stock(df: pd.DataFrame, symbol: str) -> dict:
+def simulate_stock(df: pd.DataFrame, symbol: str, exchange: str) -> dict:
     if df.empty:
         return {}
     df = compute_indicators(df)
@@ -205,7 +219,7 @@ def simulate_stock(df: pd.DataFrame, symbol: str) -> dict:
     pf = round(gross_win / gross_loss, 2) if gross_loss > 0 else 99.0
 
     return {
-        "Ticker": f"{symbol}.NSE",
+        "Ticker": f"{symbol}.{exchange}",
         "Trades_60d": len(pnl_list),
         "Win_Rate_Pct": round((wins / len(pnl_list)) * 100, 1),
         "Profit_Factor": pf,
@@ -220,17 +234,20 @@ if __name__ == "__main__":
     results = []
 
     for sym in CANDIDATE_UNIVERSE:
-        token = resolve_nse_token(scrip_df, sym)
-        if not token:
-            continue
-        candles = fetch_5m_candles(smart_api, token, days_back=60)
-        stats = simulate_stock(candles, sym)
-        if stats:
-            results.append(stats)
-            print(f"{sym}: {stats['Trades_60d']} trades | Win: {stats['Win_Rate_Pct']}% | PnL: INR {stats['Total_Net_PnL_INR']}")
+        for exch in ["NSE", "BSE"]:
+            if sym == "BSE" and exch == "BSE":
+                continue  # BSE Ltd only trades on NSE
+            token = resolve_token(scrip_df, sym, exch)
+            if not token:
+                continue
+            candles = fetch_5m_candles(smart_api, exch, token, days_back=60)
+            stats = simulate_stock(candles, sym, exch)
+            if stats:
+                results.append(stats)
+                print(f"{sym}.{exch}: {stats['Trades_60d']} trades | Win: {stats['Win_Rate_Pct']}% | PnL: INR {stats['Total_Net_PnL_INR']}")
 
     res_df = pd.DataFrame(results)
     if not res_df.empty:
         res_df.sort_values(by="Total_Net_PnL_INR", ascending=False, inplace=True)
         res_df.to_csv(SCREENER_FILE, index=False)
-        print(f"Saved {len(res_df)} ranked stocks to {SCREENER_FILE}")
+        print(f"Saved {len(res_df)} ranked NSE & BSE stocks to {SCREENER_FILE}")
