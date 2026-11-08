@@ -5,22 +5,22 @@ import yfinance as yf
 
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 
-# Corrected Watchlist: All 7 elite stocks using NSE (.NS) 5-minute feeds
+# 7-Stock Engine-A Watchlist (6 Elite + RELIANCE)
 WATCHLIST = [
-    "PAYTM.NS",     # One 97 Communications
-    "MCX.NS",       # Multi Commodity Exchange
-    "BSE.NS",       # BSE Ltd.
-    "HDFCAMC.NS",   # HDFC Asset Management
-    "LT.NS",        # Larsen & Toubro
-    "ADANIENT.NS",  # Adani Enterprises
-    "RELIANCE.NS",  # Reliance Industries
+    "PAYTM.NS",
+    "MCX.NS",
+    "BSE.NS",
+    "HDFCAMC.NS",
+    "LT.NS",
+    "ADANIENT.NS",
+    "RELIANCE.NS",
 ]
 
 PSU_GRINDERS = [
     "SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"
 ]
-CAPITAL_PER_TRADE = 100000.0  # ₹1,00,000 virtual allocation per trade
-COMMISSION_PCT = 0.0003       # 0.03% brokerage/slippage model
+CAPITAL_PER_TRADE = 100000.0
+COMMISSION_PCT = 0.0003
 
 
 def is_engine_a(ticker: str) -> bool:
@@ -35,7 +35,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     low_close = (df["Low"] - df["Close"].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["ATR"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
-
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["AVG_VOL"] = df["Volume"].rolling(20).mean()
 
@@ -245,10 +244,10 @@ if __name__ == "__main__":
     if os.path.exists(LEDGER_FILE):
         old_df = pd.read_csv(LEDGER_FILE)
         combined_df = pd.concat([old_df, new_df], ignore_index=True)
-        combined_df.drop_duplicates(subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True)
+        combined_df.drop_duplicates(subset=["Date", "Ticker"], keep="last", inplace=True)
     else:
         combined_df = new_df
 
     combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
     combined_df.to_csv(LEDGER_FILE, index=False)
-    print(f"Successfully processed watchlist. Total trades: {len(combined_df)}. Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
+    print(f"Saved {len(combined_df)} total trades. Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
