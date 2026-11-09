@@ -10,7 +10,6 @@ from SmartApi import SmartConnect
 
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 
-# 18-Instrument Optimized Portfolio (All 12 NSE Winners + 6 Profitable BSE Feeds)
 WATCHLIST = [
     {"symbol": "JINDALSTEL", "exchange": "NSE", "token": None},
     {"symbol": "JINDALSTEL", "exchange": "BSE", "token": None},
@@ -38,24 +37,37 @@ COMMISSION_PCT = 0.0003
 
 
 def get_angel_session():
-    api_key = os.environ["ANGEL_API_KEY"]
-    client_code = os.environ["ANGEL_CLIENT_CODE"]
-    pin = os.environ["ANGEL_PIN"]
-    totp_secret = os.environ["ANGEL_TOTP_SECRET"]
+    api_key = os.environ["ANGEL_API_KEY"].strip()
+    client_code = os.environ["ANGEL_CLIENT_CODE"].strip()
+    pin = os.environ["ANGEL_PIN"].strip()
+    totp_secret = os.environ["ANGEL_TOTP_SECRET"].strip().replace(" ", "")
 
-    smart_api = SmartConnect(api_key=api_key)
-    totp = pyotp.TOTP(totp_secret).now()
-    data = smart_api.generateSession(client_code, pin, totp)
-    if not data.get("status"):
-        raise RuntimeError(f"Angel One Login Failed: {data}")
-    return smart_api
+    for attempt in range(3):
+        try:
+            smart_api = SmartConnect(api_key=api_key)
+            totp = pyotp.TOTP(totp_secret).now()
+            data = smart_api.generateSession(client_code, pin, totp)
+            if data and data.get("status"):
+                return smart_api
+            print(f"Login attempt {attempt + 1} failed: {data}. Retrying in 5s...")
+        except Exception as e:
+            print(f"Login exception on attempt {attempt + 1}: {e}")
+        time.sleep(5)
+    raise RuntimeError("Angel One Login Failed after 3 attempts.")
 
 
 def load_token_map():
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-    with urllib.request.urlopen(url) as response:
-        scrip_list = json.loads(response.read().decode())
-    return pd.DataFrame(scrip_list)
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=60) as response:
+                scrip_list = json.loads(response.read().decode())
+            return pd.DataFrame(scrip_list)
+        except Exception as e:
+            print(f"ScripMaster download attempt {attempt + 1} failed: {e}")
+            time.sleep(3)
+    raise RuntimeError("Failed to download OpenAPIScripMaster.json")
 
 
 def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
@@ -76,23 +88,40 @@ def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
 
 
 def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 100) -> pd.DataFrame:
-    to_date = datetime.now()
-    from_date = to_date - timedelta(days=days_back)
-    params = {
-        "exchange": exchange,
-        "symboltoken": token,
-        "interval": "FIVE_MINUTE",
-        "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
-        "todate": to_date.strftime("%Y-%m-%d 15:30"),
-    }
-    res = smart_api.getCandleData(params)
-    time.sleep(0.45)
-    if not res.get("status") or not res.get("data"):
-        print(f"Warning: No candle data returned for token {token} on {exchange}")
+    now = datetime.now()
+    frames = []
+    # Fetch in two 50-day chunks so Angel One never rejects a 100-day request
+    chunks = [(days_back, 50), (50, 0)] if days_back > 60 else [(days_back, 0)]
+
+    for start_d, end_d in chunks:
+        from_dt = now - timedelta(days=start_d)
+        to_dt = now - timedelta(days=end_d)
+        params = {
+            "exchange": exchange,
+            "symboltoken": token,
+            "interval": "FIVE_MINUTE",
+            "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
+            "todate": to_dt.strftime("%Y-%m-%d 15:30"),
+        }
+        try:
+            res = smart_api.getCandleData(params)
+            time.sleep(0.45)
+            if res and res.get("status") and res.get("data"):
+                chunk_df = pd.DataFrame(
+                    res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
+                )
+                frames.append(chunk_df)
+        except Exception as e:
+            print(f"Chunk fetch warning ({exchange} {token}): {e}")
+            time.sleep(1)
+
+    if not frames:
         return pd.DataFrame()
 
-    df = pd.DataFrame(res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
+    df = pd.concat(frames, ignore_index=True)
     df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+    df.drop_duplicates(subset=["Timestamp"], keep="last", inplace=True)
+    df.sort_values("Timestamp", inplace=True)
     df.set_index("Timestamp", inplace=True)
     return df
 
@@ -136,6 +165,8 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
 
         entry_end = "11:10" if use_eng_a else "11:25"
         active_bars = day_df.between_time("09:30", "15:15")
+        if len(active_bars) < 5:
+            continue
 
         pos = 0
         entry_price = active_stop = tp1_price = tp2_price = init_risk = 0.0
@@ -237,7 +268,7 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
                     tp1_price = entry_price - 1.0 * init_risk
                     tp2_price = entry_price - 2.5 * init_risk
 
-        if entry_time is not None:
+        if entry_time is not None and exit_reason != "":
             qty = int(CAPITAL_PER_TRADE // entry_price)
             gross_pnl = realized_r * init_risk * qty
             fees = CAPITAL_PER_TRADE * COMMISSION_PCT * 2
