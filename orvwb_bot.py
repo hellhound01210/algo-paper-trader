@@ -87,11 +87,11 @@ def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
     return str(sub.iloc[0]["token"])
 
 
-def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 100) -> pd.DataFrame:
+def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 90) -> pd.DataFrame:
     now = datetime.now()
     frames = []
-    # Fetch in two 50-day chunks so Angel One never rejects a 100-day request
-    chunks = [(days_back, 50), (50, 0)] if days_back > 60 else [(days_back, 0)]
+    # Two 45-day chunks with automatic retry so neither chunk is ever dropped
+    chunks = [(90, 45), (45, 0)] if days_back > 60 else [(days_back, 0)]
 
     for start_d, end_d in chunks:
         from_dt = now - timedelta(days=start_d)
@@ -103,17 +103,24 @@ def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 100)
             "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
             "todate": to_dt.strftime("%Y-%m-%d 15:30"),
         }
-        try:
-            res = smart_api.getCandleData(params)
-            time.sleep(0.45)
-            if res and res.get("status") and res.get("data"):
-                chunk_df = pd.DataFrame(
-                    res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
-                )
-                frames.append(chunk_df)
-        except Exception as e:
-            print(f"Chunk fetch warning ({exchange} {token}): {e}")
-            time.sleep(1)
+        for attempt in range(3):
+            try:
+                time.sleep(0.85)  # Safe pacing for Angel One historical limit
+                res = smart_api.getCandleData(params)
+                if res and res.get("status") and res.get("data"):
+                    chunk_df = pd.DataFrame(
+                        res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
+                    )
+                    frames.append(chunk_df)
+                    break
+                elif res and res.get("errorCode") == "AB1004":
+                    print(f"Rate limit hit on {exchange} {token}, cooling down 3s (attempt {attempt + 1})...")
+                    time.sleep(3.0)
+                else:
+                    break
+            except Exception as e:
+                print(f"Chunk fetch retry {attempt + 1} ({exchange} {token}): {e}")
+                time.sleep(2.5)
 
     if not frames:
         return pd.DataFrame()
@@ -293,6 +300,7 @@ if __name__ == "__main__":
     smart_api = get_angel_session()
     scrip_df = load_token_map()
     all_new_trades = []
+    active_tickers = {f"{item['symbol']}.{item['exchange']}" for item in WATCHLIST}
 
     for item in WATCHLIST:
         sym, exch = item["symbol"], item["exchange"]
@@ -300,16 +308,26 @@ if __name__ == "__main__":
         if not token:
             print(f"Skipping {sym}.{exch}: Token not found")
             continue
-        print(f"Fetching 100-day history for {sym} on {exch} (Token: {token})...")
-        candles = fetch_5m_candles(smart_api, exch, token, days_back=100)
+        print(f"Fetching 90-day history for {sym} on {exch} (Token: {token})...")
+        candles = fetch_5m_candles(smart_api, exch, token, days_back=90)
         sim_trades = simulate_orvwb_v6(candles, sym, exch)
         print(f" -> Found {len(sim_trades)} trades for {sym}.{exch}")
         all_new_trades.extend(sim_trades)
 
     new_df = pd.DataFrame(all_new_trades)
     if not new_df.empty:
-        new_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
-        new_df.to_csv(LEDGER_FILE, index=False)
-        print(f"Saved clean 100-day ledger! Total trades: {len(new_df)}. Net PnL: INR {new_df['Net_PnL_INR'].sum():,.2f}")
+        if os.path.exists(LEDGER_FILE):
+            old_df = pd.read_csv(LEDGER_FILE)
+            old_df = old_df[old_df["Ticker"].isin(active_tickers)]
+            combined_df = pd.concat([old_df, new_df], ignore_index=True)
+            combined_df.drop_duplicates(
+                subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True
+            )
+        else:
+            combined_df = new_df
+
+        combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
+        combined_df.to_csv(LEDGER_FILE, index=False)
+        print(f"Saved complete 90-day ledger! Total trades: {len(combined_df)}. Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
     else:
         print("No trades generated across watchlist.")
