@@ -2,13 +2,14 @@ import os
 import time
 import urllib.request
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import pyotp
 from SmartApi import SmartConnect
 
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # 12-Stock Institutional Portfolio (1 Exchange Per Company, 90-Day Verified)
 WATCHLIST = [
@@ -83,13 +84,13 @@ def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
 
 
 def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 90) -> pd.DataFrame:
-    now = datetime.now()
+    now_ist = datetime.now(IST)
     frames = []
     chunks = [(90, 45), (45, 0)] if days_back > 60 else [(days_back, 0)]
 
     for start_d, end_d in chunks:
-        from_dt = now - timedelta(days=start_d)
-        to_dt = now - timedelta(days=end_d)
+        from_dt = now_ist - timedelta(days=start_d)
+        to_dt = now_ist - timedelta(days=end_d)
         params = {
             "exchange": exchange,
             "symboltoken": token,
