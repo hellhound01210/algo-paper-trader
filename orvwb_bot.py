@@ -2,34 +2,29 @@ import os
 import time
 import urllib.request
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import pyotp
 from SmartApi import SmartConnect
 
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
+IST = timezone(timedelta(hours=5, minutes=30))
 
-# 18-Instrument Optimized Portfolio (All 12 NSE Winners + 6 Profitable BSE Feeds)
+# 12-Stock Institutional Portfolio (1 Exchange Per Company, 90-Day Verified)
 WATCHLIST = [
-    {"symbol": "JINDALSTEL", "exchange": "NSE", "token": None},
-    {"symbol": "JINDALSTEL", "exchange": "BSE", "token": None},
-    {"symbol": "TRENT", "exchange": "NSE", "token": None},
-    {"symbol": "TRENT", "exchange": "BSE", "token": None},
-    {"symbol": "ADANIENT", "exchange": "NSE", "token": None},
     {"symbol": "MCX", "exchange": "NSE", "token": None},
-    {"symbol": "MCX", "exchange": "BSE", "token": "534091"},
+    {"symbol": "VEDL", "exchange": "BSE", "token": None},
     {"symbol": "RELIANCE", "exchange": "NSE", "token": None},
-    {"symbol": "RELIANCE", "exchange": "BSE", "token": None},
-    {"symbol": "INFY", "exchange": "NSE", "token": None},
-    {"symbol": "HAL", "exchange": "NSE", "token": None},
+    {"symbol": "TRENT", "exchange": "NSE", "token": None},
+    {"symbol": "ADANIENT", "exchange": "NSE", "token": None},
+    {"symbol": "JINDALSTEL", "exchange": "NSE", "token": None},
     {"symbol": "BHARTIARTL", "exchange": "NSE", "token": None},
+    {"symbol": "CDSL", "exchange": "NSE", "token": None},
+    {"symbol": "HAL", "exchange": "NSE", "token": None},
+    {"symbol": "DIXON", "exchange": "BSE", "token": None},
     {"symbol": "BAJAJFINSV", "exchange": "NSE", "token": None},
-    {"symbol": "BAJAJFINSV", "exchange": "BSE", "token": None},
     {"symbol": "ICICIBANK", "exchange": "NSE", "token": None},
-    {"symbol": "EICHERMOT", "exchange": "NSE", "token": None},
-    {"symbol": "PAYTM", "exchange": "NSE", "token": None},
-    {"symbol": "PAYTM", "exchange": "BSE", "token": "543396"},
 ]
 
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
@@ -38,24 +33,37 @@ COMMISSION_PCT = 0.0003
 
 
 def get_angel_session():
-    api_key = os.environ["ANGEL_API_KEY"]
-    client_code = os.environ["ANGEL_CLIENT_CODE"]
-    pin = os.environ["ANGEL_PIN"]
-    totp_secret = os.environ["ANGEL_TOTP_SECRET"]
+    api_key = os.environ["ANGEL_API_KEY"].strip()
+    client_code = os.environ["ANGEL_CLIENT_CODE"].strip()
+    pin = os.environ["ANGEL_PIN"].strip()
+    totp_secret = os.environ["ANGEL_TOTP_SECRET"].strip().replace(" ", "")
 
-    smart_api = SmartConnect(api_key=api_key)
-    totp = pyotp.TOTP(totp_secret).now()
-    data = smart_api.generateSession(client_code, pin, totp)
-    if not data.get("status"):
-        raise RuntimeError(f"Angel One Login Failed: {data}")
-    return smart_api
+    for attempt in range(3):
+        try:
+            smart_api = SmartConnect(api_key=api_key)
+            totp = pyotp.TOTP(totp_secret).now()
+            data = smart_api.generateSession(client_code, pin, totp)
+            if data and data.get("status"):
+                return smart_api
+            print(f"Login attempt {attempt + 1} failed: {data}. Retrying in 5s...")
+        except Exception as e:
+            print(f"Login exception on attempt {attempt + 1}: {e}")
+        time.sleep(5)
+    raise RuntimeError("Angel One Login Failed after 3 attempts.")
 
 
 def load_token_map():
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-    with urllib.request.urlopen(url) as response:
-        scrip_list = json.loads(response.read().decode())
-    return pd.DataFrame(scrip_list)
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=60) as response:
+                scrip_list = json.loads(response.read().decode())
+            return pd.DataFrame(scrip_list)
+        except Exception as e:
+            print(f"ScripMaster download attempt {attempt + 1} failed: {e}")
+            time.sleep(3)
+    raise RuntimeError("Failed to download OpenAPIScripMaster.json")
 
 
 def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
@@ -75,24 +83,48 @@ def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
     return str(sub.iloc[0]["token"])
 
 
-def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 60) -> pd.DataFrame:
-    to_date = datetime.now()
-    from_date = to_date - timedelta(days=days_back)
-    params = {
-        "exchange": exchange,
-        "symboltoken": token,
-        "interval": "FIVE_MINUTE",
-        "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
-        "todate": to_date.strftime("%Y-%m-%d 15:30"),
-    }
-    res = smart_api.getCandleData(params)
-    time.sleep(0.45)
-    if not res.get("status") or not res.get("data"):
-        print(f"Warning: No candle data returned for token {token} on {exchange}")
+def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 90) -> pd.DataFrame:
+    now_ist = datetime.now(IST)
+    frames = []
+    # Use -1 for the latest end bound so Angel One never truncates today's 15:30 IST close
+    chunks = [(90, 45), (45, -1)] if days_back > 60 else [(days_back, -1)]
+
+    for start_d, end_d in chunks:
+        from_dt = now_ist - timedelta(days=start_d)
+        to_dt = now_ist - timedelta(days=end_d)
+        params = {
+            "exchange": exchange,
+            "symboltoken": token,
+            "interval": "FIVE_MINUTE",
+            "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
+            "todate": to_dt.strftime("%Y-%m-%d 15:30"),
+        }
+        for attempt in range(3):
+            try:
+                time.sleep(0.85)
+                res = smart_api.getCandleData(params)
+                if res and res.get("status") and res.get("data"):
+                    chunk_df = pd.DataFrame(
+                        res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
+                    )
+                    frames.append(chunk_df)
+                    break
+                elif res and res.get("errorCode") == "AB1004":
+                    print(f"Rate limit hit on {exchange} {token}, cooling down 3s (attempt {attempt + 1})...")
+                    time.sleep(3.0)
+                else:
+                    break
+            except Exception as e:
+                print(f"Chunk fetch retry {attempt + 1} ({exchange} {token}): {e}")
+                time.sleep(2.5)
+
+    if not frames:
         return pd.DataFrame()
 
-    df = pd.DataFrame(res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
+    df = pd.concat(frames, ignore_index=True)
     df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+    df.drop_duplicates(subset=["Timestamp"], keep="last", inplace=True)
+    df.sort_values("Timestamp", inplace=True)
     df.set_index("Timestamp", inplace=True)
     return df
 
@@ -136,6 +168,8 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
 
         entry_end = "11:10" if use_eng_a else "11:25"
         active_bars = day_df.between_time("09:30", "15:15")
+        if len(active_bars) < 5:
+            continue
 
         pos = 0
         entry_price = active_stop = tp1_price = tp2_price = init_risk = 0.0
@@ -237,7 +271,7 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
                     tp1_price = entry_price - 1.0 * init_risk
                     tp2_price = entry_price - 2.5 * init_risk
 
-        if entry_time is not None:
+        if entry_time is not None and exit_reason != "":
             qty = int(CAPITAL_PER_TRADE // entry_price)
             gross_pnl = realized_r * init_risk * qty
             fees = CAPITAL_PER_TRADE * COMMISSION_PCT * 2
@@ -259,6 +293,8 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
 
 
 if __name__ == "__main__":
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    print(f"=== Running ORVWB v6 Bot for IST Date: {today_str} ===")
     smart_api = get_angel_session()
     scrip_df = load_token_map()
     all_new_trades = []
@@ -270,10 +306,11 @@ if __name__ == "__main__":
         if not token:
             print(f"Skipping {sym}.{exch}: Token not found")
             continue
-        print(f"Fetching {sym} on {exch} (Token: {token})...")
-        candles = fetch_5m_candles(smart_api, exch, token, days_back=60)
+        candles = fetch_5m_candles(smart_api, exch, token, days_back=90)
+        latest_bar = str(candles.index.max()) if not candles.empty else "None"
         sim_trades = simulate_orvwb_v6(candles, sym, exch)
-        print(f" -> Found {len(sim_trades)} trades for {sym}.{exch}")
+        today_trades = [t for t in sim_trades if t["Date"] == today_str]
+        print(f"{sym}.{exch} (Latest bar: {latest_bar}) -> 90d trades: {len(sim_trades)} | Today ({today_str}): {len(today_trades)}")
         all_new_trades.extend(sim_trades)
 
     new_df = pd.DataFrame(all_new_trades)
@@ -290,6 +327,7 @@ if __name__ == "__main__":
 
         combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
         combined_df.to_csv(LEDGER_FILE, index=False)
-        print(f"Saved optimized cumulative ledger! Total trades: {len(combined_df)}. Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
+        today_total = len(combined_df[combined_df["Date"] == today_str])
+        print(f"Saved 12-stock elite ledger! Total trades: {len(combined_df)} (Today {today_str}: {today_total} trades). Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
     else:
         print("No trades generated across watchlist.")
