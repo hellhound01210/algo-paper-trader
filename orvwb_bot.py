@@ -86,7 +86,8 @@ def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
 def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 90) -> pd.DataFrame:
     now_ist = datetime.now(IST)
     frames = []
-    chunks = [(90, 45), (45, 0)] if days_back > 60 else [(days_back, 0)]
+    # Use -1 for the latest end bound so Angel One never truncates today's 15:30 IST close
+    chunks = [(90, 45), (45, -1)] if days_back > 60 else [(days_back, -1)]
 
     for start_d, end_d in chunks:
         from_dt = now_ist - timedelta(days=start_d)
@@ -292,6 +293,8 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
 
 
 if __name__ == "__main__":
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    print(f"=== Running ORVWB v6 Bot for IST Date: {today_str} ===")
     smart_api = get_angel_session()
     scrip_df = load_token_map()
     all_new_trades = []
@@ -303,10 +306,11 @@ if __name__ == "__main__":
         if not token:
             print(f"Skipping {sym}.{exch}: Token not found")
             continue
-        print(f"Fetching 90-day history for {sym} on {exch} (Token: {token})...")
         candles = fetch_5m_candles(smart_api, exch, token, days_back=90)
+        latest_bar = str(candles.index.max()) if not candles.empty else "None"
         sim_trades = simulate_orvwb_v6(candles, sym, exch)
-        print(f" -> Found {len(sim_trades)} trades for {sym}.{exch}")
+        today_trades = [t for t in sim_trades if t["Date"] == today_str]
+        print(f"{sym}.{exch} (Latest bar: {latest_bar}) -> 90d trades: {len(sim_trades)} | Today ({today_str}): {len(today_trades)}")
         all_new_trades.extend(sim_trades)
 
     new_df = pd.DataFrame(all_new_trades)
@@ -323,6 +327,7 @@ if __name__ == "__main__":
 
         combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
         combined_df.to_csv(LEDGER_FILE, index=False)
-        print(f"Saved 12-stock elite ledger! Total trades: {len(combined_df)}. Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
+        today_total = len(combined_df[combined_df["Date"] == today_str])
+        print(f"Saved 12-stock elite ledger! Total trades: {len(combined_df)} (Today {today_str}: {today_total} trades). Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
     else:
         print("No trades generated across watchlist.")
