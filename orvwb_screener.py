@@ -10,7 +10,7 @@ from SmartApi import SmartConnect
 
 SCREENER_FILE = "ORVWB_Screener_Ranked.csv"
 
-# 45 High-Liquidity Momentum & F&O Candidates (Updated ETERNAL & TMPV tickers)
+# 45 High-Liquidity Momentum & F&O Candidates
 CANDIDATE_UNIVERSE = [
     "RELIANCE", "MCX", "PAYTM", "BSE", "ADANIENT", "HDFCAMC", "LT",
     "ETERNAL", "TRENT", "HAL", "BEL", "DIXON", "POLYCAB", "PERSISTENT",
@@ -21,7 +21,6 @@ CANDIDATE_UNIVERSE = [
     "SUNPHARMA", "DIVISLAB", "APOLLOHOSP", "TITAN", "BHARTIARTL", "INFY", "TCS"
 ]
 
-# Known exact BSE tokens for special symbol names
 BSE_TOKEN_OVERRIDES = {
     "PAYTM": "543396",
     "MCX": "534091",
@@ -64,7 +63,7 @@ def resolve_token(scrip_df: pd.DataFrame, symbol: str, exchange: str) -> str:
     return str(sub.iloc[0]["token"])
 
 
-def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 60) -> pd.DataFrame:
+def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 100) -> pd.DataFrame:
     to_date = datetime.now()
     from_date = to_date - timedelta(days=days_back)
     params = {
@@ -75,7 +74,7 @@ def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 60) 
         "todate": to_date.strftime("%Y-%m-%d 15:30"),
     }
     res = smart_api.getCandleData(params)
-    time.sleep(0.45)  # Respect Angel One rate limit
+    time.sleep(0.45)
     if not res.get("status") or not res.get("data"):
         return pd.DataFrame()
 
@@ -220,7 +219,7 @@ def simulate_stock(df: pd.DataFrame, symbol: str, exchange: str) -> dict:
 
     return {
         "Ticker": f"{symbol}.{exchange}",
-        "Trades_60d": len(pnl_list),
+        "Trades_100d": len(pnl_list),
         "Win_Rate_Pct": round((wins / len(pnl_list)) * 100, 1),
         "Profit_Factor": pf,
         "Mean_R": round(float(np.mean(r_list)), 2),
@@ -236,18 +235,18 @@ if __name__ == "__main__":
     for sym in CANDIDATE_UNIVERSE:
         for exch in ["NSE", "BSE"]:
             if sym == "BSE" and exch == "BSE":
-                continue  # BSE Ltd only trades on NSE
+                continue
             token = resolve_token(scrip_df, sym, exch)
             if not token:
                 continue
-            candles = fetch_5m_candles(smart_api, exch, token, days_back=60)
+            candles = fetch_5m_candles(smart_api, exch, token, days_back=100)
             stats = simulate_stock(candles, sym, exch)
             if stats:
                 results.append(stats)
-                print(f"{sym}.{exch}: {stats['Trades_60d']} trades | Win: {stats['Win_Rate_Pct']}% | PnL: INR {stats['Total_Net_PnL_INR']}")
+                print(f"{sym}.{exch}: {stats['Trades_100d']} trades | Win: {stats['Win_Rate_Pct']}% | PnL: INR {stats['Total_Net_PnL_INR']}")
 
     res_df = pd.DataFrame(results)
     if not res_df.empty:
         res_df.sort_values(by="Total_Net_PnL_INR", ascending=False, inplace=True)
         res_df.to_csv(SCREENER_FILE, index=False)
-        print(f"Saved {len(res_df)} ranked NSE & BSE stocks to {SCREENER_FILE}")
+        print(f"Saved {len(res_df)} ranked NSE & BSE stocks (100-day window) to {SCREENER_FILE}")
