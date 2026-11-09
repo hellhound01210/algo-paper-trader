@@ -10,25 +10,20 @@ from SmartApi import SmartConnect
 
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 
+# 12-Stock Institutional Portfolio (1 Exchange Per Company, 90-Day Verified)
 WATCHLIST = [
-    {"symbol": "JINDALSTEL", "exchange": "NSE", "token": None},
-    {"symbol": "JINDALSTEL", "exchange": "BSE", "token": None},
-    {"symbol": "TRENT", "exchange": "NSE", "token": None},
-    {"symbol": "TRENT", "exchange": "BSE", "token": None},
-    {"symbol": "ADANIENT", "exchange": "NSE", "token": None},
     {"symbol": "MCX", "exchange": "NSE", "token": None},
-    {"symbol": "MCX", "exchange": "BSE", "token": "534091"},
+    {"symbol": "VEDL", "exchange": "BSE", "token": None},
     {"symbol": "RELIANCE", "exchange": "NSE", "token": None},
-    {"symbol": "RELIANCE", "exchange": "BSE", "token": None},
-    {"symbol": "INFY", "exchange": "NSE", "token": None},
-    {"symbol": "HAL", "exchange": "NSE", "token": None},
+    {"symbol": "TRENT", "exchange": "NSE", "token": None},
+    {"symbol": "ADANIENT", "exchange": "NSE", "token": None},
+    {"symbol": "JINDALSTEL", "exchange": "NSE", "token": None},
     {"symbol": "BHARTIARTL", "exchange": "NSE", "token": None},
+    {"symbol": "CDSL", "exchange": "NSE", "token": None},
+    {"symbol": "HAL", "exchange": "NSE", "token": None},
+    {"symbol": "DIXON", "exchange": "BSE", "token": None},
     {"symbol": "BAJAJFINSV", "exchange": "NSE", "token": None},
-    {"symbol": "BAJAJFINSV", "exchange": "BSE", "token": None},
     {"symbol": "ICICIBANK", "exchange": "NSE", "token": None},
-    {"symbol": "EICHERMOT", "exchange": "NSE", "token": None},
-    {"symbol": "PAYTM", "exchange": "NSE", "token": None},
-    {"symbol": "PAYTM", "exchange": "BSE", "token": "543396"},
 ]
 
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
@@ -90,7 +85,6 @@ def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
 def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 90) -> pd.DataFrame:
     now = datetime.now()
     frames = []
-    # Two 45-day chunks with automatic retry so neither chunk is ever dropped
     chunks = [(90, 45), (45, 0)] if days_back > 60 else [(days_back, 0)]
 
     for start_d, end_d in chunks:
@@ -105,7 +99,7 @@ def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 90) 
         }
         for attempt in range(3):
             try:
-                time.sleep(0.85)  # Safe pacing for Angel One historical limit
+                time.sleep(0.85)
                 res = smart_api.getCandleData(params)
                 if res and res.get("status") and res.get("data"):
                     chunk_df = pd.DataFrame(
@@ -328,6 +322,6 @@ if __name__ == "__main__":
 
         combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
         combined_df.to_csv(LEDGER_FILE, index=False)
-        print(f"Saved complete 90-day ledger! Total trades: {len(combined_df)}. Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
+        print(f"Saved 12-stock elite ledger! Total trades: {len(combined_df)}. Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
     else:
         print("No trades generated across watchlist.")
