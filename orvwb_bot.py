@@ -75,7 +75,7 @@ def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
     return str(sub.iloc[0]["token"])
 
 
-def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 60) -> pd.DataFrame:
+def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 100) -> pd.DataFrame:
     to_date = datetime.now()
     from_date = to_date - timedelta(days=days_back)
     params = {
@@ -262,7 +262,6 @@ if __name__ == "__main__":
     smart_api = get_angel_session()
     scrip_df = load_token_map()
     all_new_trades = []
-    active_tickers = {f"{item['symbol']}.{item['exchange']}" for item in WATCHLIST}
 
     for item in WATCHLIST:
         sym, exch = item["symbol"], item["exchange"]
@@ -270,27 +269,16 @@ if __name__ == "__main__":
         if not token:
             print(f"Skipping {sym}.{exch}: Token not found")
             continue
-        print(f"Fetching {sym} on {exch} (Token: {token})...")
-        candles = fetch_5m_candles(smart_api, exch, token, days_back=60)
+        print(f"Fetching 100-day history for {sym} on {exch} (Token: {token})...")
+        candles = fetch_5m_candles(smart_api, exch, token, days_back=100)
         sim_trades = simulate_orvwb_v6(candles, sym, exch)
         print(f" -> Found {len(sim_trades)} trades for {sym}.{exch}")
         all_new_trades.extend(sim_trades)
 
     new_df = pd.DataFrame(all_new_trades)
     if not new_df.empty:
-        if os.path.exists(LEDGER_FILE):
-            old_df = pd.read_csv(LEDGER_FILE)
-            # Filter out removed tickers and merge with new trades cumulatively
-            old_df = old_df[old_df["Ticker"].isin(active_tickers)]
-            combined_df = pd.concat([old_df, new_df], ignore_index=True)
-            combined_df.drop_duplicates(
-                subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True
-            )
-        else:
-            combined_df = new_df
-
-        combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
-        combined_df.to_csv(LEDGER_FILE, index=False)
-        print(f"Saved optimized cumulative ledger! Total trades: {len(combined_df)}. Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
+        new_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
+        new_df.to_csv(LEDGER_FILE, index=False)
+        print(f"Saved clean 100-day ledger! Total trades: {len(new_df)}. Net PnL: INR {new_df['Net_PnL_INR'].sum():,.2f}")
     else:
         print("No trades generated across watchlist.")
