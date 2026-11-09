@@ -11,9 +11,8 @@ from SmartApi import SmartConnect
 
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 IST = timezone(timedelta(hours=5, minutes=30))
-NIFTY_TOKEN = "99926000"  # Nifty 50 Index token on NSE
 
-# 12-Stock Institutional Portfolio (90-Day Verified, 1 Exchange Per Company)
+# 12-Stock Institutional Portfolio (1 Exchange Per Company, 90-Day Verified)
 WATCHLIST = [
     {"symbol": "MCX", "exchange": "NSE", "token": None},
     {"symbol": "VEDL", "exchange": "BSE", "token": None},
@@ -30,11 +29,8 @@ WATCHLIST = [
 ]
 
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
-
-# Capital, Portfolio Heat & Friction Parameters
-CAPITAL_PER_TRADE = 100000.0    # Full ₹1,00,000 allocation per trade
-COMMISSION_PCT = 0.0003         # Standard 0.03% per side
-MAX_DAILY_TRADES = 4            # Portfolio Heat Cap: max simultaneous trades per day
+CAPITAL_PER_TRADE = 100000.0
+COMMISSION_PCT = 0.0003
 
 
 def get_angel_session():
@@ -143,26 +139,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df["Date"] = df.index.date
     hlc3 = (df["High"] + df["Low"] + df["Close"]) / 3.0
-    vol_used = np.where(df["Volume"] > 0, df["Volume"], 1.0)
-    df["PV"] = hlc3 * vol_used
-    df["VG"] = vol_used
+    df["PV"] = hlc3 * df["Volume"]
     df["Cum_PV"] = df.groupby("Date")["PV"].cumsum()
-    df["Cum_Vol"] = df.groupby("Date")["VG"].cumsum()
-    df["VWAP"] = df["Cum_PV"] / df["Cum_Vol"]
+    df["Cum_Vol"] = df.groupby("Date")["Volume"].cumsum()
+    df["VWAP"] = np.where(df["Cum_Vol"] > 0, df["Cum_PV"] / df["Cum_Vol"], hlc3)
     return df
 
 
-def build_nifty_regime_map(smart_api, days_back: int = 90) -> dict:
-    print("Fetching Nifty 50 Index regime data...")
-    ndf = fetch_5m_candles(smart_api, "NSE", NIFTY_TOKEN, days_back=days_back)
-    if ndf.empty:
-        print(" -> Nifty data unavailable; proceeding without index filter.")
-        return {}
-    ndf = compute_indicators(ndf)
-    return {ts: (float(row["Close"]), float(row["VWAP"])) for ts, row in ndf.iterrows()}
-
-
-def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: dict) -> list:
+def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
     if df.empty:
         return []
     df = compute_indicators(df)
@@ -170,8 +154,7 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: d
     engine_name = "Engine A (35/65)" if use_eng_a else "Engine B (2.5R Run)"
     trades = []
 
-    daily_groups = list(df.groupby("Date"))
-    for idx, (trade_date, day_df) in enumerate(daily_groups):
+    for trade_date, day_df in df.groupby("Date"):
         or_bars = day_df.between_time("09:15", "09:25")
         if len(or_bars) < 3:
             continue
@@ -181,18 +164,13 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: d
         or_mid = (or_high + or_low) * 0.5
         or_width = or_high - or_low
 
-        # Opening Gap Exhaustion Filter (>2.0% overnight gap)
-        prev_close = float(daily_groups[idx - 1][1]["Close"].iloc[-1]) if idx > 0 else float(or_bars["Open"].iloc[0])
-        day_open = float(or_bars["Open"].iloc[0])
-        gap_pct = (day_open - prev_close) / prev_close
-
         entry_end = "11:10" if use_eng_a else "11:25"
         active_bars = day_df.between_time("09:30", "15:15")
         if len(active_bars) < 5:
             continue
 
         pos = 0
-        entry_price = active_stop = tp1_price = tp2_price = init_risk = rel_vol_score = 0.0
+        entry_price = active_stop = tp1_price = tp2_price = init_risk = 0.0
         tp1_hit = False
         entry_time = None
         realized_r = 0.0
@@ -213,7 +191,7 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: d
                     if l <= active_stop:
                         realized_r += rem_weight * ((active_stop - entry_price) / init_risk)
                         exit_price = active_stop
-                        exit_reason = "TP1 + Ratchet/BE" if tp1_hit else "Stop Loss"
+                        exit_reason = "TP1 + BE Shield" if tp1_hit else "Stop Loss"
                         pos = 0
                         break
                     if use_eng_a and not tp1_hit and h >= tp1_price:
@@ -221,11 +199,6 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: d
                         rem_weight = 0.65
                         active_stop = entry_price + (0.15 * init_risk)
                         tp1_hit = True
-
-                    # +1.75R Ratchet Trail
-                    if tp1_hit and (h - entry_price) / init_risk >= 1.75:
-                        active_stop = max(active_stop, entry_price + 1.0 * init_risk)
-
                     if h >= tp2_price:
                         realized_r += rem_weight * 2.5
                         exit_price = tp2_price
@@ -236,7 +209,7 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: d
                     if h >= active_stop:
                         realized_r += rem_weight * ((entry_price - active_stop) / init_risk)
                         exit_price = active_stop
-                        exit_reason = "TP1 + Ratchet/BE" if tp1_hit else "Stop Loss"
+                        exit_reason = "TP1 + BE Shield" if tp1_hit else "Stop Loss"
                         pos = 0
                         break
                     if use_eng_a and not tp1_hit and l <= tp1_price:
@@ -244,11 +217,6 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: d
                         rem_weight = 0.65
                         active_stop = entry_price - (0.15 * init_risk)
                         tp1_hit = True
-
-                    # +1.75R Ratchet Trail (Short)
-                    if tp1_hit and (entry_price - l) / init_risk >= 1.75:
-                        active_stop = min(active_stop, entry_price - 1.0 * init_risk)
-
                     if l <= tp2_price:
                         realized_r += rem_weight * 2.5
                         exit_price = tp2_price
@@ -268,13 +236,6 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: d
                 bar_range = max(h - l, 0.05)
                 body_pct = abs(c - o) / bar_range
 
-                # Nifty 50 Market Regime Check
-                nifty_bull = nifty_bear = True
-                if ts in nifty_map:
-                    nc, nvwap = nifty_map[ts]
-                    nifty_bull = nc >= nvwap
-                    nifty_bear = nc <= nvwap
-
                 if use_eng_a:
                     or_valid = 0 < or_width <= (3.4 * atr)
                     has_vol = v >= (1.10 * avg_vol)
@@ -282,22 +243,19 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: d
                     bull_top = ((h - c) / bar_range) <= 0.35
                     bear_bot = ((c - l) / bar_range) <= 0.35
 
-                    long_sig = nifty_bull and (gap_pct <= 0.02) and or_valid and has_vol and strong_body and bull_top and (c > or_high) and (c > vwap) and (c > ema20)
-                    short_sig = nifty_bear and (gap_pct >= -0.02) and or_valid and has_vol and strong_body and bear_bot and (c < or_low) and (c < vwap) and (c < ema20)
+                    long_sig = or_valid and has_vol and strong_body and bull_top and (c > or_high) and (c > vwap) and (c > ema20)
+                    short_sig = or_valid and has_vol and strong_body and bear_bot and (c < or_low) and (c < vwap) and (c < ema20)
                 else:
                     has_vol = v > (1.20 * avg_vol)
-                    long_sig = nifty_bull and (gap_pct <= 0.02) and has_vol and (c > or_high) and (c > vwap)
-                    short_sig = nifty_bear and (gap_pct >= -0.02) and has_vol and (c < or_low) and (c < vwap)
+                    long_sig = has_vol and (c > or_high) and (c > vwap)
+                    short_sig = has_vol and (c < or_low) and (c < vwap)
 
                 if long_sig:
                     pos = 1
                     entry_time = t_str
                     entry_price = c
-                    rel_vol_score = v / max(avg_vol, 1.0)
                     raw_sl = min(or_mid - 0.75 * atr, l - 0.30 * atr)
-                    struct_sl = min(raw_sl, entry_price - 0.75 * atr) if use_eng_a else (or_low - 1.0 * atr)
-                    # Cap max stop width at 2.2 * ATR so freak wide stops don't cause oversized losses
-                    active_stop = max(struct_sl, entry_price - 2.2 * atr)
+                    active_stop = min(raw_sl, entry_price - 0.75 * atr) if use_eng_a else (or_low - 1.0 * atr)
                     init_risk = max(entry_price - active_stop, 0.05)
                     tp1_price = entry_price + 1.0 * init_risk
                     tp2_price = entry_price + 2.5 * init_risk
@@ -305,11 +263,8 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: d
                     pos = -1
                     entry_time = t_str
                     entry_price = c
-                    rel_vol_score = v / max(avg_vol, 1.0)
                     raw_sl = max(or_mid + 0.75 * atr, h + 0.30 * atr)
-                    struct_sl = max(raw_sl, entry_price + 0.75 * atr) if use_eng_a else (or_high + 1.0 * atr)
-                    # Cap max stop width at 2.2 * ATR
-                    active_stop = min(struct_sl, entry_price + 2.2 * atr)
+                    active_stop = max(raw_sl, entry_price + 0.75 * atr) if use_eng_a else (or_high + 1.0 * atr)
                     init_risk = max(active_stop - entry_price, 0.05)
                     tp1_price = entry_price - 1.0 * init_risk
                     tp2_price = entry_price - 2.5 * init_risk
@@ -318,7 +273,6 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: d
             qty = int(CAPITAL_PER_TRADE // entry_price)
             gross_pnl = realized_r * init_risk * qty
             fees = CAPITAL_PER_TRADE * COMMISSION_PCT * 2
-
             trades.append({
                 "Date": str(trade_date),
                 "Ticker": f"{symbol}.{exchange}",
@@ -332,7 +286,6 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: d
                 "Result_R": round(realized_r, 2),
                 "Net_PnL_INR": round(gross_pnl - fees, 2),
                 "Status": exit_reason,
-                "Rel_Vol": round(rel_vol_score, 2),
             })
     return trades
 
@@ -364,12 +317,11 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame):
 
 if __name__ == "__main__":
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    print(f"=== Running Institutional ORVWB v6 Master Bot for IST Date: {today_str} ===")
+    print(f"=== Running ORVWB v6 Bot for IST Date: {today_str} ===")
     smart_api = get_angel_session()
     scrip_df = load_token_map()
-    nifty_map = build_nifty_regime_map(smart_api, days_back=90)
-
     all_new_trades = []
+
     for item in WATCHLIST:
         sym, exch = item["symbol"], item["exchange"]
         token = resolve_token(scrip_df, item)
@@ -378,24 +330,17 @@ if __name__ == "__main__":
             continue
         candles = fetch_5m_candles(smart_api, exch, token, days_back=90)
         latest_bar = str(candles.index.max()) if not candles.empty else "None"
-        sim_trades = simulate_orvwb_v6(candles, sym, exch, nifty_map)
+        sim_trades = simulate_orvwb_v6(candles, sym, exch)
         today_trades = [t for t in sim_trades if t["Date"] == today_str]
         print(f"{sym}.{exch} (Latest bar: {latest_bar}) -> 90d trades: {len(sim_trades)} | Today ({today_str}): {len(today_trades)}")
         all_new_trades.extend(sim_trades)
 
     new_df = pd.DataFrame(all_new_trades)
     if not new_df.empty:
-        # Portfolio Heat Cap: Sort by Date, earliest Entry_Time, highest Rel_Vol -> keep top MAX_DAILY_TRADES per day
-        new_df.sort_values(by=["Date", "Entry_Time", "Rel_Vol"], ascending=[True, True, False], inplace=True)
-        new_df = new_df.groupby("Date").head(MAX_DAILY_TRADES).copy()
-        new_df.drop(columns=["Rel_Vol"], inplace=True)
-
-        # Write fresh 90-day ledger cleanly (no old stale rows mixed in)
         new_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
         new_df.to_csv(LEDGER_FILE, index=False)
-
         today_df = new_df[new_df["Date"] == today_str]
         send_telegram_summary(today_str, today_df)
-        print(f"Saved Clean Master Ledger! Total trades: {len(new_df)} (Today {today_str}: {len(today_df)} trades). Net PnL: INR {new_df['Net_PnL_INR'].sum():,.2f}")
+        print(f"Saved 12-stock elite ledger! Total trades: {len(new_df)} (Today {today_str}: {len(today_df)} trades). Net PnL: INR {new_df['Net_PnL_INR'].sum():,.2f}")
     else:
         print("No trades generated across watchlist.")
