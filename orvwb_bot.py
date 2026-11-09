@@ -31,10 +31,9 @@ WATCHLIST = [
 
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
 
-# Risk, Portfolio Heat & Friction Parameters
-FIXED_RUPEE_RISK = 1000.0       # Flat 1R risk per trade in INR
-MAX_NOTIONAL_CAP = 100000.0     # Maximum capital allocation per position
-COMMISSION_PCT = 0.0007         # 0.07% per side (STT, exchange fees, GST, slippage)
+# Capital, Portfolio Heat & Friction Parameters
+CAPITAL_PER_TRADE = 100000.0    # Full ₹1,00,000 allocation per trade
+COMMISSION_PCT = 0.0003         # Standard 0.03% per side
 MAX_DAILY_TRADES = 4            # Portfolio Heat Cap: max simultaneous trades per day
 
 
@@ -144,7 +143,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df["Date"] = df.index.date
     hlc3 = (df["High"] + df["Low"] + df["Close"]) / 3.0
-    # Fallback to equal-weighted TWAP if index volume is reported as 0
     vol_used = np.where(df["Volume"] > 0, df["Volume"], 1.0)
     df["PV"] = hlc3 * vol_used
     df["VG"] = vol_used
@@ -155,7 +153,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_nifty_regime_map(smart_api, days_back: int = 90) -> dict:
-    """Returns dict mapping Timestamp -> (Nifty_Close, Nifty_VWAP)"""
     print("Fetching Nifty 50 Index regime data...")
     ndf = fetch_5m_candles(smart_api, "NSE", NIFTY_TOKEN, days_back=days_back)
     if ndf.empty:
@@ -259,17 +256,6 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: d
                         pos = 0
                         break
 
-                # 13:00 IST Dead-Money Time-Stop (if TP1 not hit and gain < +0.40R)
-                if t_str == "13:00" and not tp1_hit:
-                    cur_move = (c - entry_price) if pos == 1 else (entry_price - c)
-                    cur_r = cur_move / init_risk
-                    if cur_r < 0.40:
-                        realized_r += rem_weight * cur_r
-                        exit_price = c
-                        exit_reason = "13:00 Dead-Money Exit"
-                        pos = 0
-                        break
-
                 if t_str >= "15:10":
                     move = (c - entry_price) if pos == 1 else (entry_price - c)
                     realized_r += rem_weight * (move / init_risk)
@@ -309,7 +295,9 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: d
                     entry_price = c
                     rel_vol_score = v / max(avg_vol, 1.0)
                     raw_sl = min(or_mid - 0.75 * atr, l - 0.30 * atr)
-                    active_stop = min(raw_sl, entry_price - 0.75 * atr) if use_eng_a else (or_low - 1.0 * atr)
+                    struct_sl = min(raw_sl, entry_price - 0.75 * atr) if use_eng_a else (or_low - 1.0 * atr)
+                    # Cap max stop width at 2.2 * ATR so freak wide stops don't cause oversized losses
+                    active_stop = max(struct_sl, entry_price - 2.2 * atr)
                     init_risk = max(entry_price - active_stop, 0.05)
                     tp1_price = entry_price + 1.0 * init_risk
                     tp2_price = entry_price + 2.5 * init_risk
@@ -319,19 +307,17 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str, nifty_map: d
                     entry_price = c
                     rel_vol_score = v / max(avg_vol, 1.0)
                     raw_sl = max(or_mid + 0.75 * atr, h + 0.30 * atr)
-                    active_stop = max(raw_sl, entry_price + 0.75 * atr) if use_eng_a else (or_high + 1.0 * atr)
+                    struct_sl = max(raw_sl, entry_price + 0.75 * atr) if use_eng_a else (or_high + 1.0 * atr)
+                    # Cap max stop width at 2.2 * ATR
+                    active_stop = min(struct_sl, entry_price + 2.2 * atr)
                     init_risk = max(active_stop - entry_price, 0.05)
                     tp1_price = entry_price - 1.0 * init_risk
                     tp2_price = entry_price - 2.5 * init_risk
 
         if entry_time is not None and exit_reason != "":
-            ideal_qty = int(FIXED_RUPEE_RISK // init_risk)
-            max_qty = int(MAX_NOTIONAL_CAP // entry_price)
-            qty = max(1, min(ideal_qty, max_qty))
-
+            qty = int(CAPITAL_PER_TRADE // entry_price)
             gross_pnl = realized_r * init_risk * qty
-            notional_value = entry_price * qty
-            fees = notional_value * COMMISSION_PCT * 2
+            fees = CAPITAL_PER_TRADE * COMMISSION_PCT * 2
 
             trades.append({
                 "Date": str(trade_date),
@@ -384,8 +370,6 @@ if __name__ == "__main__":
     nifty_map = build_nifty_regime_map(smart_api, days_back=90)
 
     all_new_trades = []
-    active_tickers = {f"{item['symbol']}.{item['exchange']}" for item in WATCHLIST}
-
     for item in WATCHLIST:
         sym, exch = item["symbol"], item["exchange"]
         token = resolve_token(scrip_df, item)
@@ -401,28 +385,17 @@ if __name__ == "__main__":
 
     new_df = pd.DataFrame(all_new_trades)
     if not new_df.empty:
-        # Apply Portfolio Heat Cap: Sort by Date, earliest Entry_Time, highest Rel_Vol -> keep top MAX_DAILY_TRADES per day
+        # Portfolio Heat Cap: Sort by Date, earliest Entry_Time, highest Rel_Vol -> keep top MAX_DAILY_TRADES per day
         new_df.sort_values(by=["Date", "Entry_Time", "Rel_Vol"], ascending=[True, True, False], inplace=True)
         new_df = new_df.groupby("Date").head(MAX_DAILY_TRADES).copy()
         new_df.drop(columns=["Rel_Vol"], inplace=True)
 
-        if os.path.exists(LEDGER_FILE):
-            old_df = pd.read_csv(LEDGER_FILE)
-            old_df = old_df[old_df["Ticker"].isin(active_tickers)]
-            combined_df = pd.concat([old_df, new_df], ignore_index=True)
-            combined_df.drop_duplicates(
-                subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True
-            )
-            combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
-            combined_df = combined_df.groupby("Date").head(MAX_DAILY_TRADES).copy()
-        else:
-            combined_df = new_df
+        # Write fresh 90-day ledger cleanly (no old stale rows mixed in)
+        new_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
+        new_df.to_csv(LEDGER_FILE, index=False)
 
-        combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
-        combined_df.to_csv(LEDGER_FILE, index=False)
-
-        today_df = combined_df[combined_df["Date"] == today_str]
+        today_df = new_df[new_df["Date"] == today_str]
         send_telegram_summary(today_str, today_df)
-        print(f"Saved Master Ledger! Total trades: {len(combined_df)} (Today {today_str}: {len(today_df)} trades). Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
+        print(f"Saved Clean Master Ledger! Total trades: {len(new_df)} (Today {today_str}: {len(today_df)} trades). Net PnL: INR {new_df['Net_PnL_INR'].sum():,.2f}")
     else:
         print("No trades generated across watchlist.")
