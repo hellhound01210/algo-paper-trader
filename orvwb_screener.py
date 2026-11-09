@@ -79,10 +79,10 @@ def resolve_token(scrip_df: pd.DataFrame, symbol: str, exchange: str) -> str:
     return str(sub.iloc[0]["token"])
 
 
-def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 100) -> pd.DataFrame:
+def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 90) -> pd.DataFrame:
     now = datetime.now()
     frames = []
-    chunks = [(days_back, 50), (50, 0)] if days_back > 60 else [(days_back, 0)]
+    chunks = [(90, 45), (45, 0)] if days_back > 60 else [(days_back, 0)]
 
     for start_d, end_d in chunks:
         from_dt = now - timedelta(days=start_d)
@@ -94,17 +94,24 @@ def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 100)
             "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
             "todate": to_dt.strftime("%Y-%m-%d 15:30"),
         }
-        try:
-            res = smart_api.getCandleData(params)
-            time.sleep(0.45)
-            if res and res.get("status") and res.get("data"):
-                chunk_df = pd.DataFrame(
-                    res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
-                )
-                frames.append(chunk_df)
-        except Exception as e:
-            print(f"Chunk fetch warning ({exchange} {token}): {e}")
-            time.sleep(1)
+        for attempt in range(3):
+            try:
+                time.sleep(0.85)
+                res = smart_api.getCandleData(params)
+                if res and res.get("status") and res.get("data"):
+                    chunk_df = pd.DataFrame(
+                        res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
+                    )
+                    frames.append(chunk_df)
+                    break
+                elif res and res.get("errorCode") == "AB1004":
+                    print(f"Rate limit hit on {exchange} {token}, cooling down 3s (attempt {attempt + 1})...")
+                    time.sleep(3.0)
+                else:
+                    break
+            except Exception as e:
+                print(f"Chunk fetch retry {attempt + 1} ({exchange} {token}): {e}")
+                time.sleep(2.5)
 
     if not frames:
         return pd.DataFrame()
@@ -260,7 +267,7 @@ def simulate_stock(df: pd.DataFrame, symbol: str, exchange: str) -> dict:
 
     return {
         "Ticker": f"{symbol}.{exchange}",
-        "Trades_100d": len(pnl_list),
+        "Trades_90d": len(pnl_list),
         "Win_Rate_Pct": round((wins / len(pnl_list)) * 100, 1),
         "Profit_Factor": pf,
         "Mean_R": round(float(np.mean(r_list)), 2),
@@ -280,14 +287,14 @@ if __name__ == "__main__":
             token = resolve_token(scrip_df, sym, exch)
             if not token:
                 continue
-            candles = fetch_5m_candles(smart_api, exch, token, days_back=100)
+            candles = fetch_5m_candles(smart_api, exch, token, days_back=90)
             stats = simulate_stock(candles, sym, exch)
             if stats:
                 results.append(stats)
-                print(f"{sym}.{exch}: {stats['Trades_100d']} trades | Win: {stats['Win_Rate_Pct']}% | PnL: INR {stats['Total_Net_PnL_INR']}")
+                print(f"{sym}.{exch}: {stats['Trades_90d']} trades | Win: {stats['Win_Rate_Pct']}% | PnL: INR {stats['Total_Net_PnL_INR']}")
 
     res_df = pd.DataFrame(results)
     if not res_df.empty:
         res_df.sort_values(by="Total_Net_PnL_INR", ascending=False, inplace=True)
         res_df.to_csv(SCREENER_FILE, index=False)
-        print(f"Saved {len(res_df)} ranked NSE & BSE stocks (100-day window) to {SCREENER_FILE}")
+        print(f"Saved {len(res_df)} ranked NSE & BSE stocks (90-day window) to {SCREENER_FILE}")
