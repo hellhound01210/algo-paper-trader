@@ -2,9 +2,11 @@ name: ORVWB Master v6 Daily Paper Trader
 
 on:
   schedule:
-    # Runs at 10:05 UTC (15:35 IST) Monday to Friday
+    # Morning live entry checks at 09:45, 10:15, 10:45, and 11:15 IST (04:15, 04:45, 05:15, 05:45 UTC)
+    - cron: '15,45 4,5 * * 1-5'
+    # Final End-of-Day Square-Off & Ledger Update at 15:35 IST (10:05 UTC)
     - cron: '5 10 * * 1-5'
-  workflow_dispatch: # Lets you tap "Run workflow" manually anytime
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,6 +14,7 @@ permissions:
 jobs:
   run-paper-trader:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,7 +25,9 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pandas numpy smartapi-python pyotp logzero websocket-client
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy smartapi-python pyotp websocket-client logzero
 
       - name: Run ORVWB Master v6 Bot
         env:
@@ -30,11 +35,14 @@ jobs:
           ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
           ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
           ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python orvwb_bot.py
 
-      - name: Commit and push ledger updates
+      - name: Commit and Push Updated Ledger
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "ORVWB Auto-Bot"
+          git config --global user.email "actions@github.com"
           git add ORVWB_v6_Elite_Ledger.csv
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update ORVWB v6 paper trading ledger" && git push)
+          git diff --staged --quiet || git commit -m "Auto-update ORVWB v6 paper trading ledger"
+          git push
