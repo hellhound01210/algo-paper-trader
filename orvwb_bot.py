@@ -12,7 +12,7 @@ from SmartApi import SmartConnect
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# 12-Stock Institutional Portfolio (1 Exchange Per Company, 90-Day Verified)
+# 12-Stock Institutional Portfolio (+₹56,968.04 Verified Configuration)
 WATCHLIST = [
     {"symbol": "MCX", "exchange": "NSE", "token": None},
     {"symbol": "VEDL", "exchange": "BSE", "token": None},
@@ -25,7 +25,7 @@ WATCHLIST = [
     {"symbol": "HAL", "exchange": "NSE", "token": None},
     {"symbol": "DIXON", "exchange": "BSE", "token": None},
     {"symbol": "BAJAJFINSV", "exchange": "NSE", "token": None},
-    {"symbol": "ICICIBANK", "exchange": "NSE", "token": None},
+    {"symbol": "HDFCAMC", "exchange": "BSE", "token": None},
 ]
 
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
@@ -321,6 +321,7 @@ if __name__ == "__main__":
     smart_api = get_angel_session()
     scrip_df = load_token_map()
     all_new_trades = []
+    active_tickers = {f"{item['symbol']}.{item['exchange']}" for item in WATCHLIST}
 
     for item in WATCHLIST:
         sym, exch = item["symbol"], item["exchange"]
@@ -337,10 +338,22 @@ if __name__ == "__main__":
 
     new_df = pd.DataFrame(all_new_trades)
     if not new_df.empty:
-        new_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
-        new_df.to_csv(LEDGER_FILE, index=False)
-        today_df = new_df[new_df["Date"] == today_str]
+        if os.path.exists(LEDGER_FILE):
+            old_df = pd.read_csv(LEDGER_FILE)
+            # Only preserve cumulative history for active watchlist stocks (automatically drops ICICIBANK.NSE)
+            old_df = old_df[old_df["Ticker"].isin(active_tickers)]
+            combined_df = pd.concat([old_df, new_df], ignore_index=True)
+            combined_df.drop_duplicates(
+                subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True
+            )
+        else:
+            combined_df = new_df
+
+        combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
+        combined_df.to_csv(LEDGER_FILE, index=False)
+
+        today_df = combined_df[combined_df["Date"] == today_str]
         send_telegram_summary(today_str, today_df)
-        print(f"Saved 12-stock elite ledger! Total trades: {len(new_df)} (Today {today_str}: {len(today_df)} trades). Net PnL: INR {new_df['Net_PnL_INR'].sum():,.2f}")
+        print(f"Saved 12-stock elite ledger! Total trades: {len(combined_df)} (Today {today_str}: {len(today_df)} trades). Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
     else:
         print("No trades generated across watchlist.")
