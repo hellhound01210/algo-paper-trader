@@ -1,14 +1,18 @@
-name: ORVWB Stock Screener (90-Day Ranker)
+name: ORVWB Master v6 Daily Paper Trader
 
 on:
-  workflow_dispatch: # Runs only when you tap "Run workflow"
+  schedule:
+    # Runs at 10:05 UTC (15:35 IST) Monday through Friday after Indian market close
+    - cron: '5 10 * * 1-5'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  screen-stocks:
+  run-paper-trader:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -19,19 +23,24 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pandas numpy smartapi-python pyotp logzero websocket-client
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy smartapi-python pyotp websocket-client logzero
 
-      - name: Run 90-Day Stock Screener
+      - name: Run ORVWB Master v6 Bot
         env:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
           ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
           ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
-        run: python orvwb_screener.py
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python orvwb_bot.py
 
-      - name: Save Ranked Screener CSV
+      - name: Commit and Push Updated Ledger
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add ORVWB_Screener_Ranked.csv
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update 90-day stock screener rankings" && git push)
+          git config --global user.name "ORVWB Auto-Bot"
+          git config --global user.email "actions@github.com"
+          git add ORVWB_v6_Elite_Ledger.csv
+          git diff --staged --quiet || git commit -m "Auto-update ORVWB v6 paper trading ledger"
+          git push
