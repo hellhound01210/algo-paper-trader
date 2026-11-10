@@ -87,7 +87,8 @@ def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
 def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 90) -> pd.DataFrame:
     now_ist = datetime.now(IST)
     frames = []
-    chunks = [(90, 45), (45, -1)] if days_back > 60 else [(days_back, -1)]
+    # Use 0 instead of -1 so todate is today's exact IST date
+    chunks = [(90, 45), (45, 0)] if days_back > 60 else [(days_back, 0)]
 
     for start_d, end_d in chunks:
         from_dt = now_ist - timedelta(days=start_d)
@@ -166,7 +167,7 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
 
         entry_end = "11:10" if use_eng_a else "11:25"
         active_bars = day_df.between_time("09:30", "15:15")
-        if len(active_bars) < 5:
+        if len(active_bars) < 1:
             continue
 
         pos = 0
@@ -177,11 +178,13 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
         rem_weight = 1.0
         exit_reason = ""
         exit_price = 0.0
+        last_close = 0.0
 
         for ts, row in active_bars.iterrows():
             t_str = ts.strftime("%H:%M")
             c, h, l, o, v = float(row["Close"]), float(row["High"]), float(row["Low"]), float(row["Open"]), float(row["Volume"])
             atr, vwap, ema20, avg_vol = float(row["ATR"]), float(row["VWAP"]), float(row["EMA20"]), float(row["AVG_VOL"])
+            last_close = c
 
             if np.isnan(atr) or np.isnan(avg_vol) or atr <= 0:
                 continue
@@ -269,6 +272,13 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
                     tp1_price = entry_price - 1.0 * init_risk
                     tp2_price = entry_price - 2.5 * init_risk
 
+        # NEW: If trade triggered today and is STILL OPEN mid-day, compute live floating status!
+        if entry_time is not None and pos != 0 and exit_reason == "":
+            move = (last_close - entry_price) if pos == 1 else (entry_price - last_close)
+            realized_r += rem_weight * (move / init_risk)
+            exit_price = last_close
+            exit_reason = "OPEN (TP1 Hit, Trailing)" if tp1_hit else "OPEN (Floating)"
+
         if entry_time is not None and exit_reason != "":
             qty = int(CAPITAL_PER_TRADE // entry_price)
             gross_pnl = realized_r * init_risk * qty
@@ -297,14 +307,14 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame):
         return
 
     if today_df.empty:
-        msg = f"📊 *ORVWB v6 Daily Report ({today_str})*\nNo trades triggered today (Strict Filter Day)."
+        msg = f"📊 *ORVWB v6 Daily Report ({today_str})*\nNo setups triggered across the 12-stock watchlist today."
     else:
-        lines = [f"📊 *ORVWB v6 Daily Report ({today_str})*"]
+        lines = [f"📊 *ORVWB v6 Live Report ({today_str})*"]
         for _, r in today_df.iterrows():
             lines.append(
-                f"• `{r['Ticker']}` ({r['Side']} @ {r['Entry_Time']}): {r['Result_R']:+.2f}R | ₹{r['Net_PnL_INR']:+.2f} ({r['Status']})"
+                f"• `{r['Ticker']}` ({r['Side']} @ {r['Entry_Time']} | Entry: ₹{r['Entry_Price']} | SL: ₹{r['Stop_Loss']}): {r['Result_R']:+.2f}R | ₹{r['Net_PnL_INR']:+.2f} [{r['Status']}]"
             )
-        lines.append(f"\n*Session Net PnL:* ₹{today_df['Net_PnL_INR'].sum():,.2f}")
+        lines.append(f"\n*Session Net PnL (Closed + Floating):* ₹{today_df['Net_PnL_INR'].sum():,.2f}")
         msg = "\n".join(lines)
 
     try:
@@ -340,7 +350,6 @@ if __name__ == "__main__":
     if not new_df.empty:
         if os.path.exists(LEDGER_FILE):
             old_df = pd.read_csv(LEDGER_FILE)
-            # Only preserve cumulative history for active watchlist stocks (automatically drops ICICIBANK.NSE)
             old_df = old_df[old_df["Ticker"].isin(active_tickers)]
             combined_df = pd.concat([old_df, new_df], ignore_index=True)
             combined_df.drop_duplicates(
