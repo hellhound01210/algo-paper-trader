@@ -1,16 +1,16 @@
-name: ORVWB Master v6 Daily Paper Trader
+name: ORVWB v6 99-Day Institutional Screener
 
 on:
   schedule:
-    # Runs at 10:05 UTC (15:35 IST) Monday through Friday after Indian market close
-    - cron: '5 10 * * 1-5'
+    # Runs automatically at 16:15 IST (10:45 UTC) on the 1st of every month
+    - cron: '45 10 1 * *'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  run-paper-trader:
+  run-screener:
     runs-on: ubuntu-latest
 
     steps:
@@ -27,7 +27,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy smartapi-python pyotp websocket-client logzero
 
-      - name: Run ORVWB Master v6 Bot
+      - name: Run 99-Day Screener
         env:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
@@ -35,12 +35,12 @@ jobs:
           ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python orvwb_bot.py
+        run: python orvwb_screener.py
 
-      - name: Commit and Push Updated Ledger
+      - name: Commit and Push Screener Ranking
         run: |
-          git config --global user.name "ORVWB Auto-Bot"
+          git config --global user.name "ORVWB Auto-Screener"
           git config --global user.email "actions@github.com"
-          git add ORVWB_v6_Elite_Ledger.csv
-          git diff --staged --quiet || git commit -m "Auto-update ORVWB v6 paper trading ledger"
+          git add ORVWB_Screener_Ranked.csv
+          git diff --staged --quiet || git commit -m "Auto-update 99-day screener rankings"
           git push
