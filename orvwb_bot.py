@@ -11,8 +11,9 @@ from SmartApi import SmartConnect
 
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 IST = timezone(timedelta(hours=5, minutes=30))
+LOOKBACK_DAYS = 99
 
-# 12-Stock Institutional Portfolio (+₹56,968.04 Verified Configuration)
+# 12-Stock Institutional Portfolio (+₹56,538.04 Verified Configuration)
 WATCHLIST = [
     {"symbol": "MCX", "exchange": "NSE", "token": None},
     {"symbol": "VEDL", "exchange": "BSE", "token": None},
@@ -84,11 +85,11 @@ def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
     return str(sub.iloc[0]["token"])
 
 
-def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = 90) -> pd.DataFrame:
+def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = LOOKBACK_DAYS) -> pd.DataFrame:
     now_ist = datetime.now(IST)
     frames = []
-    # Use 0 instead of -1 so todate is today's exact IST date
-    chunks = [(90, 45), (45, 0)] if days_back > 60 else [(days_back, 0)]
+    # Split 99-day fetch into two safe <55-day chunks for Angel One API
+    chunks = [(days_back, 50), (50, 0)] if days_back > 55 else [(days_back, 0)]
 
     for start_d, end_d in chunks:
         from_dt = now_ist - timedelta(days=start_d)
@@ -272,7 +273,7 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
                     tp1_price = entry_price - 1.0 * init_risk
                     tp2_price = entry_price - 2.5 * init_risk
 
-        # NEW: If trade triggered today and is STILL OPEN mid-day, compute live floating status!
+        # Live Intraday Floating Status (before 15:15 EOD Square-Off)
         if entry_time is not None and pos != 0 and exit_reason == "":
             move = (last_close - entry_price) if pos == 1 else (entry_price - last_close)
             realized_r += rem_weight * (move / init_risk)
@@ -300,22 +301,45 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
     return trades
 
 
-def send_telegram_summary(today_str: str, today_df: pd.DataFrame):
+def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: pd.DataFrame, missing_feeds: list):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not bot_token or not chat_id:
         return
 
+    total_pnl = combined_df["Net_PnL_INR"].sum() if not combined_df.empty else 0.0
+    win_rate = (combined_df["Net_PnL_INR"] > 0).mean() * 100 if not combined_df.empty else 0.0
+    gw = combined_df[combined_df["Net_PnL_INR"] > 0]["Net_PnL_INR"].sum() if not combined_df.empty else 0.0
+    gl = abs(combined_df[combined_df["Net_PnL_INR"] <= 0]["Net_PnL_INR"].sum()) if not combined_df.empty else 0.0
+    pf = (gw / gl) if gl > 0 else 99.0
+
+    # Compute Cumulative Max Drawdown across sessions
+    max_dd = 0.0
+    if not combined_df.empty:
+        daily_eq = combined_df.groupby("Date")["Net_PnL_INR"].sum().cumsum()
+        peak = daily_eq.cummax()
+        max_dd = float((daily_eq - peak).min())
+
+    lines = [f"📊 *ORVWB v6 Command Report ({today_str})*"]
     if today_df.empty:
-        msg = f"📊 *ORVWB v6 Daily Report ({today_str})*\nNo setups triggered across the 12-stock watchlist today."
+        lines.append("• *Today's Action:* No setups triggered across the 12-stock watchlist today.")
     else:
-        lines = [f"📊 *ORVWB v6 Live Report ({today_str})*"]
         for _, r in today_df.iterrows():
             lines.append(
                 f"• `{r['Ticker']}` ({r['Side']} @ {r['Entry_Time']} | Entry: ₹{r['Entry_Price']} | SL: ₹{r['Stop_Loss']}): {r['Result_R']:+.2f}R | ₹{r['Net_PnL_INR']:+.2f} [{r['Status']}]"
             )
-        lines.append(f"\n*Session Net PnL (Closed + Floating):* ₹{today_df['Net_PnL_INR'].sum():,.2f}")
-        msg = "\n".join(lines)
+        lines.append(f"• *Today's Net PnL:* ₹{today_df['Net_PnL_INR'].sum():,.2f}")
+
+    lines.append(
+        f"\n📈 *99d Master Ledger Telemetry:*\n"
+        f"• *Total Trades:* {len(combined_df)} | *Win Rate:* {win_rate:.1f}% | *PF:* {pf:.2f}\n"
+        f"• *Cumulative Net PnL:* ₹{total_pnl:,.2f} | *Max DD:* ₹{max_dd:,.2f}"
+    )
+
+    if missing_feeds:
+        lines.append(f"⚠️ *API Watchdog:* Missing feed on {', '.join(missing_feeds)}")
+
+    msg = "\n".join(lines)
 
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -327,10 +351,11 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame):
 
 if __name__ == "__main__":
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    print(f"=== Running ORVWB v6 Bot for IST Date: {today_str} ===")
+    print(f"=== Running ORVWB v6 Master Bot ({LOOKBACK_DAYS}d Lookback) for IST Date: {today_str} ===")
     smart_api = get_angel_session()
     scrip_df = load_token_map()
     all_new_trades = []
+    missing_feeds = []
     active_tickers = {f"{item['symbol']}.{item['exchange']}" for item in WATCHLIST}
 
     for item in WATCHLIST:
@@ -338,12 +363,16 @@ if __name__ == "__main__":
         token = resolve_token(scrip_df, item)
         if not token:
             print(f"Skipping {sym}.{exch}: Token not found")
+            missing_feeds.append(f"{sym}.{exch}")
             continue
-        candles = fetch_5m_candles(smart_api, exch, token, days_back=90)
-        latest_bar = str(candles.index.max()) if not candles.empty else "None"
+        candles = fetch_5m_candles(smart_api, exch, token, days_back=LOOKBACK_DAYS)
+        if candles.empty:
+            missing_feeds.append(f"{sym}.{exch}")
+            continue
+        latest_bar = str(candles.index.max())
         sim_trades = simulate_orvwb_v6(candles, sym, exch)
         today_trades = [t for t in sim_trades if t["Date"] == today_str]
-        print(f"{sym}.{exch} (Latest bar: {latest_bar}) -> 90d trades: {len(sim_trades)} | Today ({today_str}): {len(today_trades)}")
+        print(f"{sym}.{exch} (Latest bar: {latest_bar}) -> {LOOKBACK_DAYS}d trades: {len(sim_trades)} | Today ({today_str}): {len(today_trades)}")
         all_new_trades.extend(sim_trades)
 
     new_df = pd.DataFrame(all_new_trades)
@@ -351,6 +380,8 @@ if __name__ == "__main__":
         if os.path.exists(LEDGER_FILE):
             old_df = pd.read_csv(LEDGER_FILE)
             old_df = old_df[old_df["Ticker"].isin(active_tickers)]
+            # Drop any temporary OPEN rows from earlier today before merging
+            old_df = old_df[~old_df["Status"].astype(str).str.startswith("OPEN")]
             combined_df = pd.concat([old_df, new_df], ignore_index=True)
             combined_df.drop_duplicates(
                 subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True
@@ -362,7 +393,7 @@ if __name__ == "__main__":
         combined_df.to_csv(LEDGER_FILE, index=False)
 
         today_df = combined_df[combined_df["Date"] == today_str]
-        send_telegram_summary(today_str, today_df)
-        print(f"Saved 12-stock elite ledger! Total trades: {len(combined_df)} (Today {today_str}: {len(today_df)} trades). Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
+        send_telegram_summary(today_str, today_df, combined_df, missing_feeds)
+        print(f"Saved 12-stock {LOOKBACK_DAYS}d elite ledger! Total trades: {len(combined_df)} (Today {today_str}: {len(today_df)} trades). Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
     else:
         print("No trades generated across watchlist.")
