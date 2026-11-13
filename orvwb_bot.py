@@ -13,8 +13,7 @@ LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 IST = timezone(timedelta(hours=5, minutes=30))
 LOOKBACK_DAYS = 99
 
-# 12-Stock Institutional Portfolio (+₹56,538.04 Verified Configuration)
-# 12-Stock Institutional Portfolio (+₹60,374.97 99-Day Verified Top-12 Roster)
+# 12-Stock Institutional Portfolio (+₹63,721.94 Adaptive Conviction Roster)
 WATCHLIST = [
     {"symbol": "MCX", "exchange": "NSE", "token": None},
     {"symbol": "VEDL", "exchange": "BSE", "token": None},
@@ -30,10 +29,17 @@ WATCHLIST = [
     {"symbol": "BAJAJFINSV", "exchange": "NSE", "token": None},
 ]
 
-
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
 CAPITAL_PER_TRADE = 100000.0
 COMMISSION_PCT = 0.0003
+
+CONVICTION_CAP_MAP = {0: 70000.0, 1: 85000.0, 2: 115000.0, 3: 135000.0}
+CONVICTION_LABEL_MAP = {
+    0: "Tier C (0.70x)",
+    1: "Tier B (0.85x)",
+    2: "Tier A (1.15x)",
+    3: "Tier A+ (1.35x)",
+}
 
 
 def get_angel_session():
@@ -90,7 +96,6 @@ def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
 def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = LOOKBACK_DAYS) -> pd.DataFrame:
     now_ist = datetime.now(IST)
     frames = []
-    # Split 99-day fetch into two safe <55-day chunks for Angel One API
     chunks = [(days_back, 50), (50, 0)] if days_back > 55 else [(days_back, 0)]
 
     for start_d, end_d in chunks:
@@ -275,7 +280,6 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
                     tp1_price = entry_price - 1.0 * init_risk
                     tp2_price = entry_price - 2.5 * init_risk
 
-        # Live Intraday Floating Status (before 15:15 EOD Square-Off)
         if entry_time is not None and pos != 0 and exit_reason == "":
             move = (last_close - entry_price) if pos == 1 else (entry_price - last_close)
             realized_r += rem_weight * (move / init_risk)
@@ -303,6 +307,48 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
     return trades
 
 
+def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.sort_values(by=["Date", "Entry_Time"]).reset_index(drop=True)
+
+    # Compute Base ₹1L PnL per share from unscaled or previously scaled rows
+    if "Base_1L_PnL" not in df.columns:
+        df["Base_1L_PnL"] = df["Net_PnL_INR"]
+    else:
+        df["Base_1L_PnL"] = df["Base_1L_PnL"].fillna(df["Net_PnL_INR"])
+
+    # Walk-Forward Pre-Trade Features (Strictly using past trades per ticker)
+    prior_3_sum = (
+        df.groupby("Ticker")["Base_1L_PnL"]
+        .transform(lambda x: x.shift(1).rolling(3, min_periods=1).sum())
+        .fillna(0.0)
+    )
+    expanding_mean_r = (
+        df.groupby("Ticker")["Result_R"]
+        .transform(lambda x: x.shift(1).expanding(min_periods=3).mean())
+        .fillna(0.35)
+    )
+    is_prime_time = df["Entry_Time"] <= "10:15"
+
+    scores = (
+        is_prime_time.astype(int)
+        + (expanding_mean_r >= 0.30).astype(int)
+        + (prior_3_sum <= 0.0).astype(int)
+    )
+
+    trade_cap = scores.map(CONVICTION_CAP_MAP)
+    qty_flat = (CAPITAL_PER_TRADE // df["Entry_Price"]).clip(lower=1)
+    qty_adaptive = (trade_cap // df["Entry_Price"]).astype(int)
+
+    per_share_gross = (df["Base_1L_PnL"] + (CAPITAL_PER_TRADE * COMMISSION_PCT * 2)) / qty_flat
+    adaptive_fees = trade_cap * COMMISSION_PCT * 2
+
+    df["Conviction"] = scores.map(CONVICTION_LABEL_MAP)
+    df["Net_PnL_INR"] = (per_share_gross * qty_adaptive - adaptive_fees).round(2)
+    return df.drop(columns=["Base_1L_PnL"])
+
+
 def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: pd.DataFrame, missing_feeds: list):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -315,7 +361,6 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
     gl = abs(combined_df[combined_df["Net_PnL_INR"] <= 0]["Net_PnL_INR"].sum()) if not combined_df.empty else 0.0
     pf = (gw / gl) if gl > 0 else 99.0
 
-    # Compute Cumulative Max Drawdown across sessions
     max_dd = 0.0
     if not combined_df.empty:
         daily_eq = combined_df.groupby("Date")["Net_PnL_INR"].sum().cumsum()
@@ -327,13 +372,14 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
         lines.append("• *Today's Action:* No setups triggered across the 12-stock watchlist today.")
     else:
         for _, r in today_df.iterrows():
+            tier_str = r.get("Conviction", "Tier A")
             lines.append(
-                f"• `{r['Ticker']}` ({r['Side']} @ {r['Entry_Time']} | Entry: ₹{r['Entry_Price']} | SL: ₹{r['Stop_Loss']}): {r['Result_R']:+.2f}R | ₹{r['Net_PnL_INR']:+.2f} [{r['Status']}]"
+                f"• `{r['Ticker']}` [{tier_str}] ({r['Side']} @ {r['Entry_Time']} | Entry: ₹{r['Entry_Price']} | SL: ₹{r['Stop_Loss']}): {r['Result_R']:+.2f}R | ₹{r['Net_PnL_INR']:+.2f} [{r['Status']}]"
             )
         lines.append(f"• *Today's Net PnL:* ₹{today_df['Net_PnL_INR'].sum():,.2f}")
 
     lines.append(
-        f"\n📈 *99d Master Ledger Telemetry:*\n"
+        f"\n📈 *99d Adaptive Ledger Telemetry:*\n"
         f"• *Total Trades:* {len(combined_df)} | *Win Rate:* {win_rate:.1f}% | *PF:* {pf:.2f}\n"
         f"• *Cumulative Net PnL:* ₹{total_pnl:,.2f} | *Max DD:* ₹{max_dd:,.2f}"
     )
@@ -353,7 +399,7 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
 
 if __name__ == "__main__":
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    print(f"=== Running ORVWB v6 Master Bot ({LOOKBACK_DAYS}d Lookback) for IST Date: {today_str} ===")
+    print(f"=== Running ORVWB v6 Master Bot ({LOOKBACK_DAYS}d Adaptive Sizing) for IST Date: {today_str} ===")
     smart_api = get_angel_session()
     scrip_df = load_token_map()
     all_new_trades = []
@@ -379,10 +425,10 @@ if __name__ == "__main__":
 
     new_df = pd.DataFrame(all_new_trades)
     if not new_df.empty:
+        new_df["Base_1L_PnL"] = new_df["Net_PnL_INR"]
         if os.path.exists(LEDGER_FILE):
             old_df = pd.read_csv(LEDGER_FILE)
             old_df = old_df[old_df["Ticker"].isin(active_tickers)]
-            # Drop any temporary OPEN rows from earlier today before merging
             old_df = old_df[~old_df["Status"].astype(str).str.startswith("OPEN")]
             combined_df = pd.concat([old_df, new_df], ignore_index=True)
             combined_df.drop_duplicates(
@@ -391,11 +437,11 @@ if __name__ == "__main__":
         else:
             combined_df = new_df
 
-        combined_df.sort_values(by=["Date", "Entry_Time"], inplace=True)
+        combined_df = apply_adaptive_conviction_sizing(combined_df)
         combined_df.to_csv(LEDGER_FILE, index=False)
 
         today_df = combined_df[combined_df["Date"] == today_str]
         send_telegram_summary(today_str, today_df, combined_df, missing_feeds)
-        print(f"Saved 12-stock {LOOKBACK_DAYS}d elite ledger! Total trades: {len(combined_df)} (Today {today_str}: {len(today_df)} trades). Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
+        print(f"Saved 12-stock {LOOKBACK_DAYS}d adaptive ledger! Total trades: {len(combined_df)} (Today {today_str}: {len(today_df)} trades). Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
     else:
         print("No trades generated across watchlist.")
