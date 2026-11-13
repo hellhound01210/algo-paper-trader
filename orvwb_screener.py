@@ -7,6 +7,7 @@ import pandas as pd
 
 from orvwb_bot import (
     IST,
+    LEDGER_FILE,
     WATCHLIST,
     get_angel_session,
     load_token_map,
@@ -44,7 +45,7 @@ def fetch_screener_candles(smart_api, exchange: str, token: str, days_back: int 
         }
         for attempt in range(5):
             try:
-                time.sleep(1.25 + attempt * 1.5)
+                time.sleep(1.3 + attempt * 1.5)
                 res = smart_api.getCandleData(params)
                 if res and res.get("status") and res.get("data"):
                     chunk_df = pd.DataFrame(
@@ -53,13 +54,12 @@ def fetch_screener_candles(smart_api, exchange: str, token: str, days_back: int 
                     frames.append(chunk_df)
                     break
                 elif res and res.get("errorCode") in ("AB1004", "AB2001"):
-                    time.sleep(4.0 + attempt * 2.0)
+                    time.sleep(4.5 + attempt * 2.0)
                 else:
                     time.sleep(2.0)
             except Exception:
                 time.sleep(3.5)
 
-    # Require both 50-day chunks so partial throttling never skews 30d/45d/99d numbers
     if len(frames) < 2:
         return pd.DataFrame()
 
@@ -78,7 +78,6 @@ def send_screener_telegram(df_ranked: pd.DataFrame):
         return
 
     active_set = {f"{x['symbol']}.{x['exchange']}" for x in WATCHLIST}
-    # Only allow stocks that pass the Institutional Quality Gate into Top 12
     qualified = df_ranked[df_ranked["Quality_Gate"] == "PASS"].head(12)
 
     lines = [f"🛰️ *ORVWB v6 Multi-Horizon Screener (99d + 45d + 30d)*"]
@@ -111,23 +110,35 @@ if __name__ == "__main__":
     now_ist = datetime.now(IST)
     cutoff_45d = (now_ist - timedelta(days=45)).strftime("%Y-%m-%d")
     cutoff_30d = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")
+
+    # Load Master Ledger as a guaranteed fallback against API throttling on active stocks
+    ledger_fallback = pd.read_csv(LEDGER_FILE) if os.path.exists(LEDGER_FILE) else pd.DataFrame()
     rows = []
 
     for sym in CANDIDATE_SYMBOLS:
         for exch in ["NSE", "BSE"]:
+            ticker_name = f"{sym}.{exch}"
             token = resolve_token(scrip_df, {"symbol": sym, "exchange": exch, "token": None})
-            if not token:
-                continue
-            candles = fetch_screener_candles(smart_api, exch, token, days_back=LOOKBACK_DAYS)
-            if candles.empty:
-                continue
-            trades = simulate_orvwb_v6(candles, sym, exch)
-            if not trades:
+            trades = []
+            if token:
+                candles = fetch_screener_candles(smart_api, exch, token, days_back=LOOKBACK_DAYS)
+                if not candles.empty:
+                    trades = simulate_orvwb_v6(candles, sym, exch)
+
+            tdf = pd.DataFrame(trades) if trades else pd.DataFrame()
+
+            # Fallback to local Master Ledger if Angel One throttled an active ticker
+            if tdf.empty and not ledger_fallback.empty and ticker_name in ledger_fallback["Ticker"].values:
+                print(f"⚠️ Using Master Ledger fallback for throttled active ticker: {ticker_name}")
+                tdf = ledger_fallback[ledger_fallback["Ticker"] == ticker_name].copy()
+                if "Base_1L_PnL" in tdf.columns:
+                    tdf["Net_PnL_INR"] = tdf["Base_1L_PnL"].fillna(tdf["Net_PnL_INR"])
+
+            if tdf.empty:
                 continue
 
-            tdf = pd.DataFrame(trades)
             tdf = tdf[~tdf["Status"].astype(str).str.startswith("OPEN")]
-            if len(tdf) < 8:
+            if len(tdf) < 6:
                 continue
 
             wins = tdf[tdf["Net_PnL_INR"] > 0]["Net_PnL_INR"].sum()
@@ -144,10 +155,10 @@ if __name__ == "__main__":
             composite_score = round(0.50 * net_pnl + 0.30 * (pnl_45d * 1.6) + 0.20 * (pnl_30d * 2.2), 2)
             quality_pass = (pf >= 1.50) and (wr >= 52.5) and (net_pnl > 2000) and (pnl_45d > 0)
 
-            print(f"{sym}.{exch} -> 99d: ₹{net_pnl:,.0f} | 45d: ₹{pnl_45d:,.0f} | 30d: ₹{pnl_30d:,.0f} | PF: {pf} | Gate: {'PASS' if quality_pass else 'REJECT'}")
+            print(f"{ticker_name} -> 99d: ₹{net_pnl:,.0f} | 45d: ₹{pnl_45d:,.0f} | 30d: ₹{pnl_30d:,.0f} | PF: {pf} | Gate: {'PASS' if quality_pass else 'REJECT'}")
             rows.append({
                 "Symbol": sym,
-                "Ticker": f"{sym}.{exch}",
+                "Ticker": ticker_name,
                 "Quality_Gate": "PASS" if quality_pass else "REJECT",
                 "Trades_99d": len(tdf),
                 "Win_Rate_Pct": wr,
@@ -161,7 +172,6 @@ if __name__ == "__main__":
 
     res_df = pd.DataFrame(rows)
     if not res_df.empty:
-        # Sort PASS tickers first by Composite Score, then REJECT tickers below
         res_df["Gate_Rank"] = (res_df["Quality_Gate"] == "PASS").astype(int)
         res_df.sort_values(
             by=["Gate_Rank", "Composite_Score_INR", "Profit_Factor"],
