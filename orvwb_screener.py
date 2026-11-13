@@ -1,4 +1,5 @@
 import os
+import time
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
@@ -10,7 +11,6 @@ from orvwb_bot import (
     get_angel_session,
     load_token_map,
     resolve_token,
-    fetch_5m_candles,
     simulate_orvwb_v6,
 )
 
@@ -26,6 +26,51 @@ CANDIDATE_SYMBOLS = [
 ]
 
 
+def fetch_screener_candles(smart_api, exchange: str, token: str, days_back: int = LOOKBACK_DAYS) -> pd.DataFrame:
+    """Hardened 99-day fetcher for 60-ticker Screener runs with rate-limit backoff."""
+    now_ist = datetime.now(IST)
+    frames = []
+    chunks = [(days_back, 50), (50, 0)]
+
+    for start_d, end_d in chunks:
+        from_dt = now_ist - timedelta(days=start_d)
+        to_dt = now_ist - timedelta(days=end_d)
+        params = {
+            "exchange": exchange,
+            "symboltoken": token,
+            "interval": "FIVE_MINUTE",
+            "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
+            "todate": to_dt.strftime("%Y-%m-%d 15:30"),
+        }
+        for attempt in range(5):
+            try:
+                time.sleep(1.25 + attempt * 1.5)
+                res = smart_api.getCandleData(params)
+                if res and res.get("status") and res.get("data"):
+                    chunk_df = pd.DataFrame(
+                        res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
+                    )
+                    frames.append(chunk_df)
+                    break
+                elif res and res.get("errorCode") in ("AB1004", "AB2001"):
+                    time.sleep(4.0 + attempt * 2.0)
+                else:
+                    time.sleep(2.0)
+            except Exception:
+                time.sleep(3.5)
+
+    # Require both 50-day chunks so partial throttling never skews 30d/45d/99d numbers
+    if len(frames) < 2:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True)
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+    df.drop_duplicates(subset=["Timestamp"], keep="last", inplace=True)
+    df.sort_values("Timestamp", inplace=True)
+    df.set_index("Timestamp", inplace=True)
+    return df
+
+
 def send_screener_telegram(df_ranked: pd.DataFrame):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -33,19 +78,20 @@ def send_screener_telegram(df_ranked: pd.DataFrame):
         return
 
     active_set = {f"{x['symbol']}.{x['exchange']}" for x in WATCHLIST}
-    top12 = df_ranked.head(12)
+    # Only allow stocks that pass the Institutional Quality Gate into Top 12
+    qualified = df_ranked[df_ranked["Quality_Gate"] == "PASS"].head(12)
 
-    lines = [f"🛰️ *ORVWB v6 {LOOKBACK_DAYS}-Day Momentum Screener*"]
-    lines.append("*Top 12 Institutional Leaders (Recency-Weighted):*")
-    for idx, (_, r) in enumerate(top12.iterrows(), 1):
+    lines = [f"🛰️ *ORVWB v6 Multi-Horizon Screener (99d + 45d + 30d)*"]
+    lines.append("*Top 12 Institutional Leaders (Quality Gate: PF ≥ 1.50):*")
+    for idx, (_, r) in enumerate(qualified.iterrows(), 1):
         badge = "✅" if r["Ticker"] in active_set else "🆕"
         lines.append(
-            f"{idx}. {badge} `{r['Ticker']}`: ₹{r['Total_Net_PnL_INR']:,.0f} (30d: ₹{r['Recent_30d_PnL_INR']:,.0f}) | PF: {r['Profit_Factor']:.2f} | WR: {r['Win_Rate_Pct']:.1f}%"
+            f"{idx}. {badge} `{r['Ticker']}`: 99d ₹{r['Total_Net_PnL_INR']:,.0f} | 45d ₹{r['Recent_45d_PnL_INR']:,.0f} | PF: {r['Profit_Factor']:.2f} | WR: {r['Win_Rate_Pct']:.1f}%"
         )
 
-    new_challengers = [r["Ticker"] for _, r in top12.iterrows() if r["Ticker"] not in active_set]
+    new_challengers = [r["Ticker"] for _, r in qualified.iterrows() if r["Ticker"] not in active_set]
     if new_challengers:
-        lines.append(f"\n🔄 *Momentum Challengers Detected:* `{', '.join(new_challengers)}`")
+        lines.append(f"\n🔄 *Verified Challengers (PF ≥ 1.50):* `{', '.join(new_challengers)}`")
     else:
         lines.append("\n🔒 *Roster Status:* All 12 active tickers remain optimal.")
 
@@ -59,10 +105,12 @@ def send_screener_telegram(df_ranked: pd.DataFrame):
 
 
 if __name__ == "__main__":
-    print(f"=== Running ORVWB v6 {LOOKBACK_DAYS}-Day Recency-Weighted Screener ===")
+    print(f"=== Running ORVWB v6 Multi-Horizon (99d/45d/30d) Screener ===")
     smart_api = get_angel_session()
     scrip_df = load_token_map()
-    cutoff_30d = (datetime.now(IST) - timedelta(days=30)).strftime("%Y-%m-%d")
+    now_ist = datetime.now(IST)
+    cutoff_45d = (now_ist - timedelta(days=45)).strftime("%Y-%m-%d")
+    cutoff_30d = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")
     rows = []
 
     for sym in CANDIDATE_SYMBOLS:
@@ -70,7 +118,7 @@ if __name__ == "__main__":
             token = resolve_token(scrip_df, {"symbol": sym, "exchange": exch, "token": None})
             if not token:
                 continue
-            candles = fetch_5m_candles(smart_api, exch, token, days_back=LOOKBACK_DAYS)
+            candles = fetch_screener_candles(smart_api, exch, token, days_back=LOOKBACK_DAYS)
             if candles.empty:
                 continue
             trades = simulate_orvwb_v6(candles, sym, exch)
@@ -79,7 +127,7 @@ if __name__ == "__main__":
 
             tdf = pd.DataFrame(trades)
             tdf = tdf[~tdf["Status"].astype(str).str.startswith("OPEN")]
-            if len(tdf) < 5:
+            if len(tdf) < 8:
                 continue
 
             wins = tdf[tdf["Net_PnL_INR"] > 0]["Net_PnL_INR"].sum()
@@ -89,29 +137,39 @@ if __name__ == "__main__":
             mean_r = round(tdf["Result_R"].mean(), 2)
             net_pnl = round(tdf["Net_PnL_INR"].sum(), 2)
 
-            recent_pnl = round(tdf[tdf["Date"] >= cutoff_30d]["Net_PnL_INR"].sum(), 2)
-            prior_pnl = round(tdf[tdf["Date"] < cutoff_30d]["Net_PnL_INR"].sum(), 2)
-            # 60% weight to Recent 30d pace (normalized to 99d equivalent) + 40% weight to Full 99d PnL
-            momentum_score = round((0.60 * (recent_pnl * 2.3) + 0.40 * net_pnl), 2)
+            pnl_45d = round(tdf[tdf["Date"] >= cutoff_45d]["Net_PnL_INR"].sum(), 2)
+            pnl_30d = round(tdf[tdf["Date"] >= cutoff_30d]["Net_PnL_INR"].sum(), 2)
 
-            print(f"{sym}.{exch} -> {LOOKBACK_DAYS}d PnL: ₹{net_pnl:,.2f} (30d: ₹{recent_pnl:,.2f}) | Score: {momentum_score:,.2f} | PF: {pf}")
+            # Multi-Horizon Composite Score: 50% 99d Baseline + 30% 45d Regime + 20% 30d Velocity
+            composite_score = round(0.50 * net_pnl + 0.30 * (pnl_45d * 1.6) + 0.20 * (pnl_30d * 2.2), 2)
+            quality_pass = (pf >= 1.50) and (wr >= 52.5) and (net_pnl > 2000) and (pnl_45d > 0)
+
+            print(f"{sym}.{exch} -> 99d: ₹{net_pnl:,.0f} | 45d: ₹{pnl_45d:,.0f} | 30d: ₹{pnl_30d:,.0f} | PF: {pf} | Gate: {'PASS' if quality_pass else 'REJECT'}")
             rows.append({
                 "Symbol": sym,
                 "Ticker": f"{sym}.{exch}",
+                "Quality_Gate": "PASS" if quality_pass else "REJECT",
                 "Trades_99d": len(tdf),
                 "Win_Rate_Pct": wr,
                 "Profit_Factor": pf,
                 "Mean_R": mean_r,
-                "Recent_30d_PnL_INR": recent_pnl,
+                "Recent_30d_PnL_INR": pnl_30d,
+                "Recent_45d_PnL_INR": pnl_45d,
                 "Total_Net_PnL_INR": net_pnl,
-                "Momentum_Score_INR": momentum_score,
+                "Composite_Score_INR": composite_score,
             })
 
     res_df = pd.DataFrame(rows)
     if not res_df.empty:
-        res_df.sort_values(by=["Momentum_Score_INR", "Profit_Factor"], ascending=[False, False], inplace=True)
+        # Sort PASS tickers first by Composite Score, then REJECT tickers below
+        res_df["Gate_Rank"] = (res_df["Quality_Gate"] == "PASS").astype(int)
+        res_df.sort_values(
+            by=["Gate_Rank", "Composite_Score_INR", "Profit_Factor"],
+            ascending=[False, False, False],
+            inplace=True,
+        )
         dedup_df = res_df.drop_duplicates(subset=["Symbol"], keep="first").copy()
-        dedup_df.drop(columns=["Symbol"], inplace=True)
+        dedup_df.drop(columns=["Symbol", "Gate_Rank"], inplace=True)
         dedup_df.to_csv(SCREENER_FILE, index=False)
         send_screener_telegram(dedup_df)
-        print(f"Saved {SCREENER_FILE} with {len(dedup_df)} momentum-ranked companies!")
+        print(f"Saved {SCREENER_FILE} with {len(dedup_df)} multi-horizon ranked companies!")
