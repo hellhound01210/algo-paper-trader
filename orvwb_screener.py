@@ -1,13 +1,8 @@
 import os
-import time
 import urllib.request
 import urllib.parse
-import json
-from datetime import datetime, timedelta, timezone
-import numpy as np
+from datetime import datetime, timedelta
 import pandas as pd
-import pyotp
-from SmartApi import SmartConnect
 
 from orvwb_bot import (
     IST,
@@ -22,7 +17,6 @@ from orvwb_bot import (
 SCREENER_FILE = "ORVWB_Screener_Ranked.csv"
 LOOKBACK_DAYS = 99
 
-# 30-Stock High-Beta Liquid Institutional Universe (Tested on Both NSE & BSE)
 CANDIDATE_SYMBOLS = [
     "MCX", "VEDL", "RELIANCE", "TRENT", "ADANIENT", "JINDALSTEL",
     "BHARTIARTL", "CDSL", "HAL", "DIXON", "BAJAJFINSV", "HDFCAMC",
@@ -41,17 +35,17 @@ def send_screener_telegram(df_ranked: pd.DataFrame):
     active_set = {f"{x['symbol']}.{x['exchange']}" for x in WATCHLIST}
     top12 = df_ranked.head(12)
 
-    lines = [f"🛰️ *ORVWB v6 {LOOKBACK_DAYS}-Day Screener Intelligence*"]
-    lines.append("*Top 12 Institutional Leaders (1 Per Company):*")
+    lines = [f"🛰️ *ORVWB v6 {LOOKBACK_DAYS}-Day Momentum Screener*"]
+    lines.append("*Top 12 Institutional Leaders (Recency-Weighted):*")
     for idx, (_, r) in enumerate(top12.iterrows(), 1):
         badge = "✅" if r["Ticker"] in active_set else "🆕"
         lines.append(
-            f"{idx}. {badge} `{r['Ticker']}`: ₹{r['Total_Net_PnL_INR']:,.0f} | PF: {r['Profit_Factor']:.2f} | WR: {r['Win_Rate_Pct']:.1f}% ({int(r['Trades_99d'])}T)"
+            f"{idx}. {badge} `{r['Ticker']}`: ₹{r['Total_Net_PnL_INR']:,.0f} (30d: ₹{r['Recent_30d_PnL_INR']:,.0f}) | PF: {r['Profit_Factor']:.2f} | WR: {r['Win_Rate_Pct']:.1f}%"
         )
 
     new_challengers = [r["Ticker"] for _, r in top12.iterrows() if r["Ticker"] not in active_set]
     if new_challengers:
-        lines.append(f"\n🔄 *Rotation Candidates Detected:* `{', '.join(new_challengers)}`")
+        lines.append(f"\n🔄 *Momentum Challengers Detected:* `{', '.join(new_challengers)}`")
     else:
         lines.append("\n🔒 *Roster Status:* All 12 active tickers remain optimal.")
 
@@ -65,9 +59,10 @@ def send_screener_telegram(df_ranked: pd.DataFrame):
 
 
 if __name__ == "__main__":
-    print(f"=== Running ORVWB v6 {LOOKBACK_DAYS}-Day Institutional Screener ===")
+    print(f"=== Running ORVWB v6 {LOOKBACK_DAYS}-Day Recency-Weighted Screener ===")
     smart_api = get_angel_session()
     scrip_df = load_token_map()
+    cutoff_30d = (datetime.now(IST) - timedelta(days=30)).strftime("%Y-%m-%d")
     rows = []
 
     for sym in CANDIDATE_SYMBOLS:
@@ -83,7 +78,6 @@ if __name__ == "__main__":
                 continue
 
             tdf = pd.DataFrame(trades)
-            # Exclude open floating mid-day rows from historical ranking
             tdf = tdf[~tdf["Status"].astype(str).str.startswith("OPEN")]
             if len(tdf) < 5:
                 continue
@@ -95,7 +89,12 @@ if __name__ == "__main__":
             mean_r = round(tdf["Result_R"].mean(), 2)
             net_pnl = round(tdf["Net_PnL_INR"].sum(), 2)
 
-            print(f"{sym}.{exch} -> {LOOKBACK_DAYS}d Trades: {len(tdf)} | WR: {wr}% | PF: {pf} | PnL: INR {net_pnl:,.2f}")
+            recent_pnl = round(tdf[tdf["Date"] >= cutoff_30d]["Net_PnL_INR"].sum(), 2)
+            prior_pnl = round(tdf[tdf["Date"] < cutoff_30d]["Net_PnL_INR"].sum(), 2)
+            # 60% weight to Recent 30d pace (normalized to 99d equivalent) + 40% weight to Full 99d PnL
+            momentum_score = round((0.60 * (recent_pnl * 2.3) + 0.40 * net_pnl), 2)
+
+            print(f"{sym}.{exch} -> {LOOKBACK_DAYS}d PnL: ₹{net_pnl:,.2f} (30d: ₹{recent_pnl:,.2f}) | Score: {momentum_score:,.2f} | PF: {pf}")
             rows.append({
                 "Symbol": sym,
                 "Ticker": f"{sym}.{exch}",
@@ -103,15 +102,16 @@ if __name__ == "__main__":
                 "Win_Rate_Pct": wr,
                 "Profit_Factor": pf,
                 "Mean_R": mean_r,
+                "Recent_30d_PnL_INR": recent_pnl,
                 "Total_Net_PnL_INR": net_pnl,
+                "Momentum_Score_INR": momentum_score,
             })
 
     res_df = pd.DataFrame(rows)
     if not res_df.empty:
-        # Sort by Total Net PnL descending, keep best exchange per company
-        res_df.sort_values(by=["Total_Net_PnL_INR", "Profit_Factor"], ascending=[False, False], inplace=True)
+        res_df.sort_values(by=["Momentum_Score_INR", "Profit_Factor"], ascending=[False, False], inplace=True)
         dedup_df = res_df.drop_duplicates(subset=["Symbol"], keep="first").copy()
         dedup_df.drop(columns=["Symbol"], inplace=True)
         dedup_df.to_csv(SCREENER_FILE, index=False)
         send_screener_telegram(dedup_df)
-        print(f"Saved {SCREENER_FILE} with {len(dedup_df)} ranked companies!")
+        print(f"Saved {SCREENER_FILE} with {len(dedup_df)} momentum-ranked companies!")
