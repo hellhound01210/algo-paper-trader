@@ -13,21 +13,22 @@ LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 IST = timezone(timedelta(hours=5, minutes=30))
 LOOKBACK_DAYS = 99
 
-# 12-Stock Institutional Portfolio (100% Quality-Gate PASS Roster)
+# 12-Stock Institutional Portfolio (150-Stock Funnel Top-12 PASS Leaders)
 WATCHLIST = [
+    {"symbol": "POLICYBZR", "exchange": "NSE", "token": None},
     {"symbol": "MCX", "exchange": "NSE", "token": None},
-    {"symbol": "VEDL", "exchange": "BSE", "token": None},
-    {"symbol": "SBIN", "exchange": "NSE", "token": None},
     {"symbol": "JINDALSTEL", "exchange": "NSE", "token": None},
-    {"symbol": "TRENT", "exchange": "NSE", "token": None},
+    {"symbol": "VEDL", "exchange": "BSE", "token": None},
+    {"symbol": "LAURUSLABS", "exchange": "NSE", "token": None},
+    {"symbol": "SHRIRAMFIN", "exchange": "NSE", "token": None},
+    {"symbol": "PAYTM", "exchange": "NSE", "token": None},
     {"symbol": "RELIANCE", "exchange": "NSE", "token": None},
-    {"symbol": "HDFCAMC", "exchange": "BSE", "token": None},
     {"symbol": "BHARTIARTL", "exchange": "NSE", "token": None},
-    {"symbol": "CDSL", "exchange": "NSE", "token": None},
-    {"symbol": "BAJAJFINSV", "exchange": "NSE", "token": None},
-    {"symbol": "CHOLAFIN", "exchange": "BSE", "token": None},
-    {"symbol": "ICICIBANK", "exchange": "NSE", "token": None},
+    {"symbol": "BSE", "exchange": "NSE", "token": None},
+    {"symbol": "TRENT", "exchange": "NSE", "token": None},
+    {"symbol": "HDFCAMC", "exchange": "BSE", "token": None},
 ]
+
 
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
 CAPITAL_PER_TRADE = 100000.0
