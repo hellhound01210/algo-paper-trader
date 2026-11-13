@@ -13,20 +13,20 @@ LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 IST = timezone(timedelta(hours=5, minutes=30))
 LOOKBACK_DAYS = 99
 
-# 12-Stock Institutional Portfolio (+₹63,721.94 Adaptive Conviction Roster)
+# 12-Stock Institutional Portfolio (100% Quality-Gate PASS Roster)
 WATCHLIST = [
     {"symbol": "MCX", "exchange": "NSE", "token": None},
     {"symbol": "VEDL", "exchange": "BSE", "token": None},
     {"symbol": "SBIN", "exchange": "NSE", "token": None},
-    {"symbol": "RELIANCE", "exchange": "NSE", "token": None},
-    {"symbol": "TRENT", "exchange": "NSE", "token": None},
     {"symbol": "JINDALSTEL", "exchange": "NSE", "token": None},
+    {"symbol": "TRENT", "exchange": "NSE", "token": None},
+    {"symbol": "RELIANCE", "exchange": "NSE", "token": None},
     {"symbol": "HDFCAMC", "exchange": "BSE", "token": None},
-    {"symbol": "CDSL", "exchange": "NSE", "token": None},
     {"symbol": "BHARTIARTL", "exchange": "NSE", "token": None},
-    {"symbol": "RECLTD", "exchange": "BSE", "token": None},
-    {"symbol": "HAL", "exchange": "NSE", "token": None},
+    {"symbol": "CDSL", "exchange": "NSE", "token": None},
     {"symbol": "BAJAJFINSV", "exchange": "NSE", "token": None},
+    {"symbol": "CHOLAFIN", "exchange": "BSE", "token": None},
+    {"symbol": "ICICIBANK", "exchange": "NSE", "token": None},
 ]
 
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
@@ -108,9 +108,9 @@ def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = LOOK
             "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
             "todate": to_dt.strftime("%Y-%m-%d 15:30"),
         }
-        for attempt in range(3):
+        for attempt in range(4):
             try:
-                time.sleep(0.85)
+                time.sleep(1.0 + attempt * 1.2)
                 res = smart_api.getCandleData(params)
                 if res and res.get("status") and res.get("data"):
                     chunk_df = pd.DataFrame(
@@ -118,10 +118,10 @@ def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = LOOK
                     )
                     frames.append(chunk_df)
                     break
-                elif res and res.get("errorCode") == "AB1004":
-                    time.sleep(3.0)
+                elif res and res.get("errorCode") in ("AB1004", "AB2001"):
+                    time.sleep(3.5 + attempt * 1.5)
                 else:
-                    break
+                    time.sleep(1.5)
             except Exception:
                 time.sleep(2.5)
 
@@ -290,6 +290,7 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
             qty = int(CAPITAL_PER_TRADE // entry_price)
             gross_pnl = realized_r * init_risk * qty
             fees = CAPITAL_PER_TRADE * COMMISSION_PCT * 2
+            base_pnl = round(gross_pnl - fees, 2)
             trades.append({
                 "Date": str(trade_date),
                 "Ticker": f"{symbol}.{exchange}",
@@ -301,7 +302,8 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
                 "Target_2.5R": round(tp2_price, 2),
                 "Exit_Price": round(exit_price, 2),
                 "Result_R": round(realized_r, 2),
-                "Net_PnL_INR": round(gross_pnl - fees, 2),
+                "Base_1L_PnL": base_pnl,
+                "Net_PnL_INR": base_pnl,
                 "Status": exit_reason,
             })
     return trades
@@ -312,13 +314,19 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
         return df
     df = df.sort_values(by=["Date", "Entry_Time"]).reset_index(drop=True)
 
-    # Compute Base ₹1L PnL per share from unscaled or previously scaled rows
+    # Always reconstruct or use exact unscaled Base_1L_PnL so repeated runs never double-scale
     if "Base_1L_PnL" not in df.columns:
-        df["Base_1L_PnL"] = df["Net_PnL_INR"]
-    else:
-        df["Base_1L_PnL"] = df["Base_1L_PnL"].fillna(df["Net_PnL_INR"])
+        df["Base_1L_PnL"] = np.nan
 
-    # Walk-Forward Pre-Trade Features (Strictly using past trades per ticker)
+    missing_base = df["Base_1L_PnL"].isna()
+    if missing_base.any():
+        init_risk = (df.loc[missing_base, "Target_2.5R"] - df.loc[missing_base, "Entry_Price"]).abs() / 2.5
+        qty_1l = (CAPITAL_PER_TRADE // df.loc[missing_base, "Entry_Price"]).clip(lower=1)
+        fees_1l = CAPITAL_PER_TRADE * COMMISSION_PCT * 2
+        df.loc[missing_base, "Base_1L_PnL"] = (
+            df.loc[missing_base, "Result_R"] * init_risk * qty_1l - fees_1l
+        ).round(2)
+
     prior_3_sum = (
         df.groupby("Ticker")["Base_1L_PnL"]
         .transform(lambda x: x.shift(1).rolling(3, min_periods=1).sum())
@@ -346,7 +354,7 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
 
     df["Conviction"] = scores.map(CONVICTION_LABEL_MAP)
     df["Net_PnL_INR"] = (per_share_gross * qty_adaptive - adaptive_fees).round(2)
-    return df.drop(columns=["Base_1L_PnL"])
+    return df
 
 
 def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: pd.DataFrame, missing_feeds: list):
@@ -385,7 +393,7 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
     )
 
     if missing_feeds:
-        lines.append(f"⚠️ *API Watchdog:* Missing feed on {', '.join(missing_feeds)}")
+        lines.append(f"⚠️ *API Watchdog:* Missing feed on {', '.join(missing_feeds)} (preserved from ledger)")
 
     msg = "\n".join(lines)
 
@@ -425,11 +433,13 @@ if __name__ == "__main__":
 
     new_df = pd.DataFrame(all_new_trades)
     if not new_df.empty:
-        new_df["Base_1L_PnL"] = new_df["Net_PnL_INR"]
         if os.path.exists(LEDGER_FILE):
             old_df = pd.read_csv(LEDGER_FILE)
             old_df = old_df[old_df["Ticker"].isin(active_tickers)]
             old_df = old_df[~old_df["Status"].astype(str).str.startswith("OPEN")]
+            # Force clean Base_1L_PnL reconstruction on old_df so previously double-scaled rows are healed
+            if "Base_1L_PnL" not in old_df.columns:
+                old_df["Base_1L_PnL"] = np.nan
             combined_df = pd.concat([old_df, new_df], ignore_index=True)
             combined_df.drop_duplicates(
                 subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True
