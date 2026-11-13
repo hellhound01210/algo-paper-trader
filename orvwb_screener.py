@@ -3,6 +3,7 @@ import time
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
+import numpy as np
 import pandas as pd
 
 from orvwb_bot import (
@@ -17,18 +18,116 @@ from orvwb_bot import (
 
 SCREENER_FILE = "ORVWB_Screener_Ranked.csv"
 LOOKBACK_DAYS = 99
+STAGE1_TOP_N = 35
 
-CANDIDATE_SYMBOLS = [
-    "MCX", "VEDL", "RELIANCE", "TRENT", "ADANIENT", "JINDALSTEL",
-    "BHARTIARTL", "CDSL", "HAL", "DIXON", "BAJAJFINSV", "HDFCAMC",
-    "ICICIBANK", "SBIN", "TATAMOTORS", "TATASTEEL", "HINDALCO", "DLF",
-    "CHOLAFIN", "PFC", "RECLTD", "BEL", "BHEL", "POLYCAB",
-    "PERSISTENT", "COFORGE", "LT", "M&M", "AXISBANK", "ZOMATO"
+# Full 150-Stock Liquid Institutional Universe (Nifty 200 / F&O Leaders Across All Sectors)
+INSTITUTIONAL_UNIVERSE = [
+    # Commodities, Exchanges & Capital Markets
+    "MCX", "CDSL", "BSE", "ANGELONE", "CAMSSERV", "KFINTECH", "IEX", "MANAPPURAM", "MUTHOOTFIN",
+    # Metals & Mining
+    "VEDL", "JINDALSTEL", "TATASTEEL", "HINDALCO", "JSWSTEEL", "NMDC", "SAIL", "NATIONALUM", "HINDCOPPER", "APLAPOLLO",
+    # Banking & PSU Grinders
+    "SBIN", "ICICIBANK", "HDFCBANK", "AXISBANK", "KOTAKBANK", "INDUSINDBK", "BANKBARODA", "PNB",
+    "CANBK", "UNIONBANK", "IDFCFIRSTB", "FEDERALBNK", "AUBANK", "BANDHANBNK", "RBLBANK", "KARURVYSYA",
+    # NBFCs, Insurance & Asset Management
+    "BAJAJFINSV", "BAJFINANCE", "CHOLAFIN", "HDFCAMC", "SHREECEM", "SHRIRAMFIN", "PFC", "RECLTD",
+    "IRFC", "HUDCO", "LICHSGFIN", "LTF", "M&MFIN", "POONAWALLA", "SBICARD", "SBILIFE", "HDFCLIFE", "ICICIPRULI",
+    # Defense, Aerospace & Heavy Engineering
+    "HAL", "BEL", "BHEL", "MAZDOCK", "COCHINSHIP", "BDL", "PARAS", "DATAPATTNS", "BEML",
+    # Energy, Power & Oil/Gas
+    "RELIANCE", "ONGC", "NTPC", "POWERGRID", "COALINDIA", "TATAPOWER", "ADANIPOWER", "ADANIGREEN",
+    "ADANIENSOL", "JSWENERGY", "NHPC", "SJVN", "TORNTPOWER", "CESC", "BPCL", "HPCL", "IOC", "GAIL", "PETRONET", "IGL",
+    # Retail, Consumer & New-Age Tech
+    "TRENT", "ZOMATO", "NYKAA", "PAYTM", "POLICYBZR", "DELHIVERY", "TITAN", "DMART", "INDHOTEL",
+    "JUBLFOOD", "DEVYANI", "VBL", "GODREJCP", "DABUR", "MARICO", "COLPAL", "ITC", "HINDUNILVR", "NESTLEIND", "TATACONSUM",
+    # EMS, Cables & Industrials
+    "DIXON", "KAYNES", "AMBER", "SYRMA", "POLYCAB", "KEI", "HAVELLS", "VOLTAS", "BLUESTARCO",
+    "CUMMINSIND", "SIEMENS", "ABB", "CGPOWER", "THERMAX", "ASTRAL", "SUPREMEIND", "PIIND",
+    # Infrastructure, Ports & Real Estate
+    "LT", "ADANIENT", "ADANIPORTS", "DLF", "GODREJPROP", "MACROTECH", "PRESTIGE", "OBEROIRLTY",
+    "PHOENIXLTD", "NCC", "IRCON", "RVNL", "IRB", "GMRAIRPORT", "CONCOR", "ULTRACEMCO", "AMBUJACEM",
+    # Automobiles & EV Supply Chain
+    "TATAMOTORS", "M&M", "MARUTI", "BAJAJ-AUTO", "TVSMOTOR", "EICHERMOT", "HEROMOTOCO",
+    "ASHOKLEY", "BHARATFORG", "SONACOMS", "MOTHERSON", "EXIDEIND", "AMARAJABAT", "BALKRISIND", "APOLLOTYRE",
+    # IT, Software & Telecom
+    "BHARTIARTL", "INDUSTOWER", "IDEA", "TATACOMM", "PERSISTENT", "COFORGE", "TCS", "INFY",
+    "HCLTECH", "WIPRO", "TECHM", "LTIM", "MPHASIS", "KPITTECH", "TATAELXSI", "OFSS", "CYIENT",
+    # Pharma & Healthcare
+    "SUNPHARMA", "CIPLA", "DRREDDY", "DIVISLAB", "LUPIN", "AUROPHARMA", "BIOCON", "ZYDUSLIFE",
+    "TORNTPHARM", "ALKEM", "LAURUSLABS", "GRANULES", "APOLLOHOSP", "MAXHEALTH", "FORTIS", "SYNGENE"
 ]
+
+# Deduplicate universe while preserving order
+INSTITUTIONAL_UNIVERSE = list(dict.fromkeys(INSTITUTIONAL_UNIVERSE))
+
+# Tickers known to have superior ORVWB fill profiles on BSE (tested on both NSE and BSE in Stage 2)
+DUAL_EXCHANGE_SYMBOLS = {"VEDL", "HDFCAMC", "CHOLAFIN", "RECLTD", "DIXON", "DLF", "BHEL", "PFC", "BEL", "M&M"}
+
+
+def fetch_daily_regime_score(smart_api, scrip_df: pd.DataFrame, symbol: str) -> dict:
+    """Stage 1: Fast 1-Day candle scan to rank intraday expansion, body efficiency, and turnover."""
+    token = resolve_token(scrip_df, {"symbol": symbol, "exchange": "NSE", "token": None})
+    exch = "NSE"
+    if not token:
+        token = resolve_token(scrip_df, {"symbol": symbol, "exchange": "BSE", "token": None})
+        exch = "BSE"
+    if not token:
+        return {}
+
+    now_ist = datetime.now(IST)
+    from_dt = now_ist - timedelta(days=45)
+    params = {
+        "exchange": exch,
+        "symboltoken": token,
+        "interval": "ONE_DAY",
+        "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
+        "todate": now_ist.strftime("%Y-%m-%d 15:30"),
+    }
+
+    for attempt in range(3):
+        try:
+            time.sleep(0.55 + attempt * 0.8)
+            res = smart_api.getCandleData(params)
+            if res and res.get("status") and res.get("data"):
+                df = pd.DataFrame(
+                    res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
+                )
+                if len(df) < 12:
+                    return {}
+                c = df["Close"].astype(float)
+                h = df["High"].astype(float)
+                l = df["Low"].astype(float)
+                o = df["Open"].astype(float)
+                v = df["Volume"].astype(float)
+
+                turnover_cr = float((c * v).tail(20).mean() / 1e7)
+                # Filter out low-liquidity stocks (< ₹25 Cr daily turnover on NSE)
+                if exch == "NSE" and turnover_cr < 25.0:
+                    return {}
+
+                range_pct = float(((h - l) / c.clip(lower=1.0) * 100.0).tail(20).mean())
+                body_eff = float(( (c - o).abs() / (h - l).clip(lower=0.05) ).tail(20).mean())
+
+                # Regime Score rewards wide daily range + strong directional closes + deep liquidity
+                regime_score = round(range_pct * (0.5 + body_eff) * np.log1p(max(turnover_cr, 1.0)), 2)
+                return {
+                    "Symbol": symbol,
+                    "Daily_Range_Pct": round(range_pct, 2),
+                    "Body_Eff": round(body_eff, 2),
+                    "Turnover_Cr": round(turnover_cr, 1),
+                    "Regime_Score": regime_score,
+                }
+            elif res and res.get("errorCode") in ("AB1004", "AB2001"):
+                time.sleep(2.5 + attempt * 1.5)
+            else:
+                break
+        except Exception:
+            time.sleep(1.5)
+    return {}
 
 
 def fetch_screener_candles(smart_api, exchange: str, token: str, days_back: int = LOOKBACK_DAYS) -> pd.DataFrame:
-    """Hardened 99-day fetcher for 60-ticker Screener runs with rate-limit backoff."""
+    """Stage 2: Hardened 99-day 5m fetcher for Top-35 finalists with rate-limit backoff."""
     now_ist = datetime.now(IST)
     frames = []
     chunks = [(days_back, 50), (50, 0)]
@@ -45,7 +144,7 @@ def fetch_screener_candles(smart_api, exchange: str, token: str, days_back: int 
         }
         for attempt in range(5):
             try:
-                time.sleep(1.3 + attempt * 1.5)
+                time.sleep(1.25 + attempt * 1.5)
                 res = smart_api.getCandleData(params)
                 if res and res.get("status") and res.get("data"):
                     chunk_df = pd.DataFrame(
@@ -54,11 +153,11 @@ def fetch_screener_candles(smart_api, exchange: str, token: str, days_back: int 
                     frames.append(chunk_df)
                     break
                 elif res and res.get("errorCode") in ("AB1004", "AB2001"):
-                    time.sleep(4.5 + attempt * 2.0)
+                    time.sleep(4.0 + attempt * 2.0)
                 else:
                     time.sleep(2.0)
             except Exception:
-                time.sleep(3.5)
+                time.sleep(3.0)
 
     if len(frames) < 2:
         return pd.DataFrame()
@@ -71,7 +170,7 @@ def fetch_screener_candles(smart_api, exchange: str, token: str, days_back: int 
     return df
 
 
-def send_screener_telegram(df_ranked: pd.DataFrame):
+def send_screener_telegram(df_ranked: pd.DataFrame, scanned_count: int):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not bot_token or not chat_id or df_ranked.empty:
@@ -80,7 +179,8 @@ def send_screener_telegram(df_ranked: pd.DataFrame):
     active_set = {f"{x['symbol']}.{x['exchange']}" for x in WATCHLIST}
     qualified = df_ranked[df_ranked["Quality_Gate"] == "PASS"].head(12)
 
-    lines = [f"🛰️ *ORVWB v6 Multi-Horizon Screener (99d + 45d + 30d)*"]
+    lines = [f"🛰️ *ORVWB v6 Two-Stage Institutional Screener*"]
+    lines.append(f"• *Universe Scanned:* {scanned_count} Liquid F&O Stocks -> Top {len(df_ranked)} Deep-Audited")
     lines.append("*Top 12 Institutional Leaders (Quality Gate: PF ≥ 1.50):*")
     for idx, (_, r) in enumerate(qualified.iterrows(), 1):
         badge = "✅" if r["Ticker"] in active_set else "🆕"
@@ -92,7 +192,7 @@ def send_screener_telegram(df_ranked: pd.DataFrame):
     if new_challengers:
         lines.append(f"\n🔄 *Verified Challengers (PF ≥ 1.50):* `{', '.join(new_challengers)}`")
     else:
-        lines.append("\n🔒 *Roster Status:* All 12 active tickers remain optimal.")
+        lines.append("\n🔒 *Roster Status:* All active tickers remain optimal.")
 
     msg = "\n".join(lines)
     try:
@@ -104,19 +204,43 @@ def send_screener_telegram(df_ranked: pd.DataFrame):
 
 
 if __name__ == "__main__":
-    print(f"=== Running ORVWB v6 Multi-Horizon (99d/45d/30d) Screener ===")
+    print(f"=== Stage 1: Scanning {len(INSTITUTIONAL_UNIVERSE)} Institutional Stocks (Daily Regime Filter) ===")
     smart_api = get_angel_session()
     scrip_df = load_token_map()
     now_ist = datetime.now(IST)
     cutoff_45d = (now_ist - timedelta(days=45)).strftime("%Y-%m-%d")
     cutoff_30d = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")
 
-    # Load Master Ledger as a guaranteed fallback against API throttling on active stocks
+    stage1_rows = []
+    for sym in INSTITUTIONAL_UNIVERSE:
+        info = fetch_daily_regime_score(smart_api, scrip_df, sym)
+        if info:
+            stage1_rows.append(info)
+
+    stage1_df = pd.DataFrame(stage1_rows)
+    active_symbols = [x["symbol"] for x in WATCHLIST]
+
+    if not stage1_df.empty:
+        stage1_df.sort_values(by="Regime_Score", ascending=False, inplace=True)
+        top_symbols = stage1_df.head(STAGE1_TOP_N)["Symbol"].tolist()
+        # Always include active watchlist symbols + top daily expansion leaders
+        finalist_symbols = list(dict.fromkeys(active_symbols + top_symbols))
+        print(f"Stage 1 Complete: Selected {len(finalist_symbols)} High-Expansion Finalists from {len(stage1_df)} liquid stocks.")
+    else:
+        finalist_symbols = list(dict.fromkeys(active_symbols + INSTITUTIONAL_UNIVERSE[:30]))
+
+    print(f"\n=== Stage 2: Running 99-Day 5m ORVWB v6 Simulation on {len(finalist_symbols)} Finalists ===")
     ledger_fallback = pd.read_csv(LEDGER_FILE) if os.path.exists(LEDGER_FILE) else pd.DataFrame()
+    active_exch_map = {x["symbol"]: x["exchange"] for x in WATCHLIST}
     rows = []
 
-    for sym in CANDIDATE_SYMBOLS:
-        for exch in ["NSE", "BSE"]:
+    for sym in finalist_symbols:
+        # Test primary exchange + BSE only for dual-exchange candidates to cut API load by 45%
+        exchanges_to_test = ["NSE", "BSE"] if sym in DUAL_EXCHANGE_SYMBOLS else ["NSE"]
+        if sym in active_exch_map and active_exch_map[sym] not in exchanges_to_test:
+            exchanges_to_test.append(active_exch_map[sym])
+
+        for exch in exchanges_to_test:
             ticker_name = f"{sym}.{exch}"
             token = resolve_token(scrip_df, {"symbol": sym, "exchange": exch, "token": None})
             trades = []
@@ -181,5 +305,5 @@ if __name__ == "__main__":
         dedup_df = res_df.drop_duplicates(subset=["Symbol"], keep="first").copy()
         dedup_df.drop(columns=["Symbol", "Gate_Rank"], inplace=True)
         dedup_df.to_csv(SCREENER_FILE, index=False)
-        send_screener_telegram(dedup_df)
+        send_screener_telegram(dedup_df, len(INSTITUTIONAL_UNIVERSE))
         print(f"Saved {SCREENER_FILE} with {len(dedup_df)} multi-horizon ranked companies!")
