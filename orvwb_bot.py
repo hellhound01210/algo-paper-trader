@@ -13,7 +13,7 @@ LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 IST = timezone(timedelta(hours=5, minutes=30))
 LOOKBACK_DAYS = 99
 
-# 12-Stock Institutional Portfolio (150-Stock Funnel Top-12 PASS Leaders)
+# 16-Stock Institutional Portfolio (All 16 Quality-Gate PASS Leaders > ₹100/share)
 WATCHLIST = [
     {"symbol": "POLICYBZR", "exchange": "NSE", "token": None},
     {"symbol": "MCX", "exchange": "NSE", "token": None},
@@ -25,9 +25,14 @@ WATCHLIST = [
     {"symbol": "RELIANCE", "exchange": "NSE", "token": None},
     {"symbol": "BHARTIARTL", "exchange": "NSE", "token": None},
     {"symbol": "BSE", "exchange": "NSE", "token": None},
+    {"symbol": "BAJAJFINSV", "exchange": "NSE", "token": None},
     {"symbol": "TRENT", "exchange": "NSE", "token": None},
     {"symbol": "HDFCAMC", "exchange": "BSE", "token": None},
+    {"symbol": "CDSL", "exchange": "NSE", "token": None},
+    {"symbol": "ICICIBANK", "exchange": "NSE", "token": None},
+    {"symbol": "PARAS", "exchange": "NSE", "token": None},
 ]
+
 
 
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
