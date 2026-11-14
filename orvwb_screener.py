@@ -19,6 +19,7 @@ from orvwb_bot import (
 SCREENER_FILE = "ORVWB_Screener_Ranked.csv"
 LOOKBACK_DAYS = 99
 STAGE1_TOP_N = 35
+MIN_SHARE_PRICE = 100.0
 
 # Full 150-Stock Liquid Institutional Universe (Nifty 200 / F&O Leaders Across All Sectors)
 INSTITUTIONAL_UNIVERSE = [
@@ -50,17 +51,14 @@ INSTITUTIONAL_UNIVERSE = [
     "TATAMOTORS", "M&M", "MARUTI", "BAJAJ-AUTO", "TVSMOTOR", "EICHERMOT", "HEROMOTOCO",
     "ASHOKLEY", "BHARATFORG", "SONACOMS", "MOTHERSON", "EXIDEIND", "AMARAJABAT", "BALKRISIND", "APOLLOTYRE",
     # IT, Software & Telecom
-    "BHARTIARTL", "INDUSTOWER", "IDEA", "TATACOMM", "PERSISTENT", "COFORGE", "TCS", "INFY",
+    "BHARTIARTL", "INDUSTOWER", "TATACOMM", "PERSISTENT", "COFORGE", "TCS", "INFY",
     "HCLTECH", "WIPRO", "TECHM", "LTIM", "MPHASIS", "KPITTECH", "TATAELXSI", "OFSS", "CYIENT",
     # Pharma & Healthcare
     "SUNPHARMA", "CIPLA", "DRREDDY", "DIVISLAB", "LUPIN", "AUROPHARMA", "BIOCON", "ZYDUSLIFE",
     "TORNTPHARM", "ALKEM", "LAURUSLABS", "GRANULES", "APOLLOHOSP", "MAXHEALTH", "FORTIS", "SYNGENE"
 ]
 
-# Deduplicate universe while preserving order
 INSTITUTIONAL_UNIVERSE = list(dict.fromkeys(INSTITUTIONAL_UNIVERSE))
-
-# Tickers known to have superior ORVWB fill profiles on BSE (tested on both NSE and BSE in Stage 2)
 DUAL_EXCHANGE_SYMBOLS = {"VEDL", "HDFCAMC", "CHOLAFIN", "RECLTD", "DIXON", "DLF", "BHEL", "PFC", "BEL", "M&M"}
 
 
@@ -100,15 +98,17 @@ def fetch_daily_regime_score(smart_api, scrip_df: pd.DataFrame, symbol: str) -> 
                 o = df["Open"].astype(float)
                 v = df["Volume"].astype(float)
 
+                # Enforce minimum ₹100 share price floor to eliminate penny-stock tick slippage
+                if float(c.iloc[-1]) < MIN_SHARE_PRICE:
+                    return {}
+
                 turnover_cr = float((c * v).tail(20).mean() / 1e7)
-                # Filter out low-liquidity stocks (< ₹25 Cr daily turnover on NSE)
                 if exch == "NSE" and turnover_cr < 25.0:
                     return {}
 
                 range_pct = float(((h - l) / c.clip(lower=1.0) * 100.0).tail(20).mean())
-                body_eff = float(( (c - o).abs() / (h - l).clip(lower=0.05) ).tail(20).mean())
+                body_eff = float(((c - o).abs() / (h - l).clip(lower=0.05)).tail(20).mean())
 
-                # Regime Score rewards wide daily range + strong directional closes + deep liquidity
                 regime_score = round(range_pct * (0.5 + body_eff) * np.log1p(max(turnover_cr, 1.0)), 2)
                 return {
                     "Symbol": symbol,
@@ -176,12 +176,13 @@ def send_screener_telegram(df_ranked: pd.DataFrame, scanned_count: int):
     if not bot_token or not chat_id or df_ranked.empty:
         return
 
+    roster_count = len(WATCHLIST)
     active_set = {f"{x['symbol']}.{x['exchange']}" for x in WATCHLIST}
-    qualified = df_ranked[df_ranked["Quality_Gate"] == "PASS"].head(12)
+    qualified = df_ranked[df_ranked["Quality_Gate"] == "PASS"].head(roster_count)
 
     lines = [f"🛰️ *ORVWB v6 Two-Stage Institutional Screener*"]
     lines.append(f"• *Universe Scanned:* {scanned_count} Liquid F&O Stocks -> Top {len(df_ranked)} Deep-Audited")
-    lines.append("*Top 12 Institutional Leaders (Quality Gate: PF ≥ 1.50):*")
+    lines.append(f"*Top {len(qualified)} Institutional Leaders (Quality Gate: PF ≥ 1.50):*")
     for idx, (_, r) in enumerate(qualified.iterrows(), 1):
         badge = "✅" if r["Ticker"] in active_set else "🆕"
         lines.append(
@@ -192,7 +193,7 @@ def send_screener_telegram(df_ranked: pd.DataFrame, scanned_count: int):
     if new_challengers:
         lines.append(f"\n🔄 *Verified Challengers (PF ≥ 1.50):* `{', '.join(new_challengers)}`")
     else:
-        lines.append("\n🔒 *Roster Status:* All active tickers remain optimal.")
+        lines.append(f"\n🔒 *Roster Status:* All {roster_count} active tickers remain optimal.")
 
     msg = "\n".join(lines)
     try:
@@ -223,11 +224,10 @@ if __name__ == "__main__":
     if not stage1_df.empty:
         stage1_df.sort_values(by="Regime_Score", ascending=False, inplace=True)
         top_symbols = stage1_df.head(STAGE1_TOP_N)["Symbol"].tolist()
-        # Always include active watchlist symbols + top daily expansion leaders
         finalist_symbols = list(dict.fromkeys(active_symbols + top_symbols))
         print(f"Stage 1 Complete: Selected {len(finalist_symbols)} High-Expansion Finalists from {len(stage1_df)} liquid stocks.")
     else:
-        finalist_symbols = list(dict.fromkeys(active_symbols + INSTITUTIONAL_UNIVERSE[:30]))
+        finalist_symbols = list(dict.fromkeys(active_symbols + INSTITUTIONAL_UNIVERSE[:35]))
 
     print(f"\n=== Stage 2: Running 99-Day 5m ORVWB v6 Simulation on {len(finalist_symbols)} Finalists ===")
     ledger_fallback = pd.read_csv(LEDGER_FILE) if os.path.exists(LEDGER_FILE) else pd.DataFrame()
@@ -235,7 +235,6 @@ if __name__ == "__main__":
     rows = []
 
     for sym in finalist_symbols:
-        # Test primary exchange + BSE only for dual-exchange candidates to cut API load by 45%
         exchanges_to_test = ["NSE", "BSE"] if sym in DUAL_EXCHANGE_SYMBOLS else ["NSE"]
         if sym in active_exch_map and active_exch_map[sym] not in exchanges_to_test:
             exchanges_to_test.append(active_exch_map[sym])
@@ -251,7 +250,6 @@ if __name__ == "__main__":
 
             tdf = pd.DataFrame(trades) if trades else pd.DataFrame()
 
-            # Fallback to local Master Ledger if Angel One throttled an active ticker
             if tdf.empty and not ledger_fallback.empty and ticker_name in ledger_fallback["Ticker"].values:
                 print(f"⚠️ Using Master Ledger fallback for throttled active ticker: {ticker_name}")
                 tdf = ledger_fallback[ledger_fallback["Ticker"] == ticker_name].copy()
@@ -265,6 +263,9 @@ if __name__ == "__main__":
             if len(tdf) < 6:
                 continue
 
+            if float(tdf["Entry_Price"].iloc[-1]) < MIN_SHARE_PRICE:
+                continue
+
             wins = tdf[tdf["Net_PnL_INR"] > 0]["Net_PnL_INR"].sum()
             losses = abs(tdf[tdf["Net_PnL_INR"] <= 0]["Net_PnL_INR"].sum())
             pf = round(wins / losses, 2) if losses > 0 else 99.0
@@ -275,7 +276,6 @@ if __name__ == "__main__":
             pnl_45d = round(tdf[tdf["Date"] >= cutoff_45d]["Net_PnL_INR"].sum(), 2)
             pnl_30d = round(tdf[tdf["Date"] >= cutoff_30d]["Net_PnL_INR"].sum(), 2)
 
-            # Multi-Horizon Composite Score: 50% 99d Baseline + 30% 45d Regime + 20% 30d Velocity
             composite_score = round(0.50 * net_pnl + 0.30 * (pnl_45d * 1.6) + 0.20 * (pnl_30d * 2.2), 2)
             quality_pass = (pf >= 1.50) and (wr >= 52.5) and (net_pnl > 2000) and (pnl_45d > 0)
 
