@@ -2,8 +2,8 @@ name: ORVWB v6 99-Day Institutional Screener
 
 on:
   schedule:
-    # Runs automatically at 16:15 IST (10:45 UTC) on the 1st of every month
-    - cron: '45 10 1 * *'
+    # Runs automatically every Saturday at 10:00 AM IST (04:30 UTC)
+    - cron: '30 4 * * 6'
   workflow_dispatch:
 
 permissions:
@@ -21,13 +21,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy smartapi-python pyotp websocket-client logzero
+          pip install pandas numpy pyotp smartapi-python websocket-client logzero
 
-      - name: Run 99-Day Screener
+      - name: Execute Two-Stage Institutional Screener
         env:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
@@ -37,10 +38,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python orvwb_screener.py
 
-      - name: Commit and Push Screener Ranking
+      - name: Commit and Push Ranked Screener CSV
         run: |
-          git config --global user.name "ORVWB Auto-Screener"
+          git config --global user.name "actions-user"
           git config --global user.email "actions@github.com"
           git add ORVWB_Screener_Ranked.csv
-          git diff --staged --quiet || git commit -m "Auto-update 99-day screener rankings"
-          git push
+          git diff --staged --quiet || (git commit -m "Auto-update ORVWB v6 99-day institutional screener" && git pull --rebase origin main && git push)
