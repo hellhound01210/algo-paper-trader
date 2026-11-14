@@ -33,8 +33,6 @@ WATCHLIST = [
     {"symbol": "PARAS", "exchange": "NSE", "token": None},
 ]
 
-
-
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
 CAPITAL_PER_TRADE = 100000.0
 COMMISSION_PCT = 0.0003
@@ -320,7 +318,6 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
         return df
     df = df.sort_values(by=["Date", "Entry_Time"]).reset_index(drop=True)
 
-    # Always reconstruct or use exact unscaled Base_1L_PnL so repeated runs never double-scale
     if "Base_1L_PnL" not in df.columns:
         df["Base_1L_PnL"] = np.nan
 
@@ -345,11 +342,24 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
     )
     is_prime_time = df["Entry_Time"] <= "10:15"
 
-    scores = (
+    # Factor 4: Walk-Forward Intraday Market Breadth Synchronizer (up to current Entry_Time)
+    same_side_cnt = []
+    opp_side_cnt = []
+    for idx, row in df.iterrows():
+        sub = df[(df["Date"] == row["Date"]) & (df["Entry_Time"] <= row["Entry_Time"]) & (df.index != idx)]
+        same_side_cnt.append(int((sub["Side"] == row["Side"]).sum()))
+        opp_side_cnt.append(int((sub["Side"] != row["Side"]).sum()))
+
+    same_s = pd.Series(same_side_cnt, index=df.index)
+    opp_s = pd.Series(opp_side_cnt, index=df.index)
+    breadth_adj = np.where((same_s >= 1) & (opp_s == 0), 1, np.where(opp_s >= 1, -1, 0))
+
+    base_scores = (
         is_prime_time.astype(int)
         + (expanding_mean_r >= 0.30).astype(int)
         + (prior_3_sum <= 0.0).astype(int)
     )
+    scores = (base_scores + breadth_adj).clip(0, 3)
 
     trade_cap = scores.map(CONVICTION_CAP_MAP)
     qty_flat = (CAPITAL_PER_TRADE // df["Entry_Price"]).clip(lower=1)
@@ -369,6 +379,7 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
     if not bot_token or not chat_id:
         return
 
+    roster_count = len(WATCHLIST)
     total_pnl = combined_df["Net_PnL_INR"].sum() if not combined_df.empty else 0.0
     win_rate = (combined_df["Net_PnL_INR"] > 0).mean() * 100 if not combined_df.empty else 0.0
     gw = combined_df[combined_df["Net_PnL_INR"] > 0]["Net_PnL_INR"].sum() if not combined_df.empty else 0.0
@@ -383,7 +394,7 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
 
     lines = [f"📊 *ORVWB v6 Command Report ({today_str})*"]
     if today_df.empty:
-        lines.append("• *Today's Action:* No setups triggered across the 12-stock watchlist today.")
+        lines.append(f"• *Today's Action:* No setups triggered across the {roster_count}-stock watchlist today.")
     else:
         for _, r in today_df.iterrows():
             tier_str = r.get("Conviction", "Tier A")
@@ -393,7 +404,7 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
         lines.append(f"• *Today's Net PnL:* ₹{today_df['Net_PnL_INR'].sum():,.2f}")
 
     lines.append(
-        f"\n📈 *99d Adaptive Ledger Telemetry:*\n"
+        f"\n📈 *99d Adaptive Ledger Telemetry ({roster_count} Stocks):*\n"
         f"• *Total Trades:* {len(combined_df)} | *Win Rate:* {win_rate:.1f}% | *PF:* {pf:.2f}\n"
         f"• *Cumulative Net PnL:* ₹{total_pnl:,.2f} | *Max DD:* ₹{max_dd:,.2f}"
     )
@@ -413,7 +424,8 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
 
 if __name__ == "__main__":
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    print(f"=== Running ORVWB v6 Master Bot ({LOOKBACK_DAYS}d Adaptive Sizing) for IST Date: {today_str} ===")
+    roster_count = len(WATCHLIST)
+    print(f"=== Running ORVWB v6 Master Bot ({roster_count} Stocks | {LOOKBACK_DAYS}d Lookback) for IST Date: {today_str} ===")
     smart_api = get_angel_session()
     scrip_df = load_token_map()
     all_new_trades = []
@@ -443,7 +455,6 @@ if __name__ == "__main__":
             old_df = pd.read_csv(LEDGER_FILE)
             old_df = old_df[old_df["Ticker"].isin(active_tickers)]
             old_df = old_df[~old_df["Status"].astype(str).str.startswith("OPEN")]
-            # Force clean Base_1L_PnL reconstruction on old_df so previously double-scaled rows are healed
             if "Base_1L_PnL" not in old_df.columns:
                 old_df["Base_1L_PnL"] = np.nan
             combined_df = pd.concat([old_df, new_df], ignore_index=True)
@@ -458,6 +469,6 @@ if __name__ == "__main__":
 
         today_df = combined_df[combined_df["Date"] == today_str]
         send_telegram_summary(today_str, today_df, combined_df, missing_feeds)
-        print(f"Saved 12-stock {LOOKBACK_DAYS}d adaptive ledger! Total trades: {len(combined_df)} (Today {today_str}: {len(today_df)} trades). Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
+        print(f"Saved {roster_count}-stock {LOOKBACK_DAYS}d adaptive ledger! Total trades: {len(combined_df)} (Today {today_str}: {len(today_df)} trades). Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
     else:
         print("No trades generated across watchlist.")
