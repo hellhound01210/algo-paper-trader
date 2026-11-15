@@ -1,23 +1,18 @@
-name: ORVWB v6 Daily Paper Trader
+name: ORVWB v6 Continuous Shadow-Live Trader
 
 on:
   schedule:
-    # Monday-Friday (1-5) IST Market Checkpoints (UTC = IST - 5h30m)
-    - cron: '10 4 * * 1-5'   # 09:40 IST (Opening Range Breakout Check)
-    - cron: '25 4 * * 1-5'   # 09:55 IST (Prime Morning Momentum Check)
-    - cron: '45 4 * * 1-5'   # 10:15 IST (Prime Window Cutoff Check)
-    - cron: '15 5 * * 1-5'   # 10:45 IST (Mid-Morning Expansion Check)
-    - cron: '50 5 * * 1-5'   # 11:20 IST (Final Entry Window Cutoff Check)
-    - cron: '30 7 * * 1-5'   # 13:00 IST (Midday Trail & TP Check)
-    - cron: '5 10 * * 1-5'   # 15:35 IST (Final 15:15 EOD Square-Off & Ledger Commit)
+    # Wakes up at 09:20 IST (03:50 UTC) Monday-Friday and runs continuously until 15:18 IST
+    - cron: '50 3 * * 1-5'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  paper-trade:
+  shadow-live-trade:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -34,7 +29,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy pyotp smartapi-python websocket-client logzero
 
-      - name: Execute ORVWB v6 Paper Trading Bot
+      - name: Run Continuous Intraday Shadow-Live Loop (09:20 - 15:18 IST)
         env:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
@@ -42,11 +37,12 @@ jobs:
           ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python orvwb_bot.py
+        run: python orvwb_bot.py --live-loop
 
-      - name: Commit and Push Updated Elite Ledger
+      - name: Commit and Push Final EOD Elite Ledger
+        if: always()
         run: |
           git config --global user.name "actions-user"
           git config --global user.email "actions@github.com"
           git add ORVWB_v6_Elite_Ledger.csv
-          git diff --staged --quiet || (git commit -m "Auto-update ORVWB v6 16-stock adaptive ledger" && git pull --rebase origin main && git push)
+          git diff --staged --quiet || (git commit -m "Auto-update ORVWB v6 shadow-live ledger" && git pull --rebase origin main && git push)
