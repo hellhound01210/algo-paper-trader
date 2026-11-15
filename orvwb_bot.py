@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import urllib.request
 import urllib.parse
@@ -15,7 +16,10 @@ IST = timezone(timedelta(hours=5, minutes=30))
 LOOKBACK_DAYS = 99
 MIN_SHARE_PRICE = 100.0
 
-# Fallback 16-Stock Institutional Portfolio (Used if Screener CSV is missing or incomplete)
+# Master Switch: Keep False during 1-2 Month Shadow-Live Testing!
+LIVE_ORDER_EXECUTION = False
+
+# Fallback 16-Stock Institutional Portfolio
 DEFAULT_WATCHLIST = [
     {"symbol": "POLICYBZR", "exchange": "NSE", "token": None},
     {"symbol": "MCX", "exchange": "NSE", "token": None},
@@ -37,7 +41,6 @@ DEFAULT_WATCHLIST = [
 
 
 def load_dynamic_watchlist(default_list: list, min_stocks: int = 8, max_stocks: int = 16) -> list:
-    """Automatically loads top Quality-Gate PASS stocks from ORVWB_Screener_Ranked.csv with circuit breakers."""
     if not os.path.exists(SCREENER_FILE):
         return default_list
     try:
@@ -91,7 +94,7 @@ def get_angel_session():
     pin = os.environ["ANGEL_PIN"].strip()
     totp_secret = os.environ["ANGEL_TOTP_SECRET"].strip().replace(" ", "")
 
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             smart_api = SmartConnect(api_key=api_key)
             totp = pyotp.TOTP(totp_secret).now()
@@ -102,7 +105,7 @@ def get_angel_session():
         except Exception as e:
             print(f"Login exception on attempt {attempt + 1}: {e}")
         time.sleep(5)
-    raise RuntimeError("Angel One Login Failed after 3 attempts.")
+    raise RuntimeError("Angel One Login Failed after 4 attempts.")
 
 
 def load_token_map():
@@ -140,6 +143,7 @@ def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = LOOK
     now_ist = datetime.now(IST)
     frames = []
     chunks = [(days_back, 50), (50, 0)] if days_back > 55 else [(days_back, 0)]
+    base_sleep = 0.35 if days_back <= 10 else 1.0
 
     for start_d, end_d in chunks:
         from_dt = now_ist - timedelta(days=start_d)
@@ -153,7 +157,7 @@ def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = LOOK
         }
         for attempt in range(4):
             try:
-                time.sleep(1.0 + attempt * 1.2)
+                time.sleep(base_sleep + attempt * 1.0)
                 res = smart_api.getCandleData(params)
                 if res and res.get("status") and res.get("data"):
                     chunk_df = pd.DataFrame(
@@ -162,11 +166,11 @@ def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = LOOK
                     frames.append(chunk_df)
                     break
                 elif res and res.get("errorCode") in ("AB1004", "AB2001"):
-                    time.sleep(3.5 + attempt * 1.5)
+                    time.sleep(3.0 + attempt * 1.5)
                 else:
-                    time.sleep(1.5)
+                    time.sleep(1.2)
             except Exception:
-                time.sleep(2.5)
+                time.sleep(2.0)
 
     if not frames:
         return pd.DataFrame()
@@ -287,7 +291,6 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
                     break
 
             if pos == 0 and entry_time is None and t_str <= entry_end:
-                # Hard Penny-Stock Guard: Never trigger entries below ₹100/share
                 if c < MIN_SHARE_PRICE:
                     continue
 
@@ -385,7 +388,6 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
     )
     is_prime_time = df["Entry_Time"] <= "10:15"
 
-    # Factor 4: Walk-Forward Intraday Market Breadth Synchronizer (up to current Entry_Time)
     same_side_cnt = []
     opp_side_cnt = []
     for idx, row in df.iterrows():
@@ -416,12 +418,20 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: pd.DataFrame, missing_feeds: list):
+def send_telegram_text(msg: str):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not bot_token or not chat_id:
         return
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        data = urllib.parse.urlencode({"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}).encode()
+        urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10)
+    except Exception as e:
+        print(f"Telegram alert skipped: {e}")
 
+
+def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: pd.DataFrame, missing_feeds: list):
     roster_count = len(WATCHLIST)
     total_pnl = combined_df["Net_PnL_INR"].sum() if not combined_df.empty else 0.0
     win_rate = (combined_df["Net_PnL_INR"] > 0).mean() * 100 if not combined_df.empty else 0.0
@@ -455,22 +465,10 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
     if missing_feeds:
         lines.append(f"⚠️ *API Watchdog:* Missing feed on {', '.join(missing_feeds)} (preserved from ledger)")
 
-    msg = "\n".join(lines)
-
-    try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        data = urllib.parse.urlencode({"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}).encode()
-        urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10)
-    except Exception as e:
-        print(f"Telegram alert skipped: {e}")
+    send_telegram_text("\n".join(lines))
 
 
-if __name__ == "__main__":
-    today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    roster_count = len(WATCHLIST)
-    print(f"=== Running ORVWB v6 Master Bot ({roster_count} Dynamic Stocks | {LOOKBACK_DAYS}d Lookback) for IST Date: {today_str} ===")
-    smart_api = get_angel_session()
-    scrip_df = load_token_map()
+def run_single_pass(smart_api, scrip_df: pd.DataFrame, today_str: str) -> tuple:
     all_new_trades = []
     missing_feeds = []
     active_tickers = {f"{item['symbol']}.{item['exchange']}" for item in WATCHLIST}
@@ -479,39 +477,172 @@ if __name__ == "__main__":
         sym, exch = item["symbol"], item["exchange"]
         token = resolve_token(scrip_df, item)
         if not token:
-            print(f"Skipping {sym}.{exch}: Token not found")
             missing_feeds.append(f"{sym}.{exch}")
             continue
         candles = fetch_5m_candles(smart_api, exch, token, days_back=LOOKBACK_DAYS)
         if candles.empty:
             missing_feeds.append(f"{sym}.{exch}")
             continue
-        latest_bar = str(candles.index.max())
         sim_trades = simulate_orvwb_v6(candles, sym, exch)
-        today_trades = [t for t in sim_trades if t["Date"] == today_str]
-        print(f"{sym}.{exch} (Latest bar: {latest_bar}) -> {LOOKBACK_DAYS}d trades: {len(sim_trades)} | Today ({today_str}): {len(today_trades)}")
         all_new_trades.extend(sim_trades)
 
     new_df = pd.DataFrame(all_new_trades)
-    if not new_df.empty:
-        if os.path.exists(LEDGER_FILE):
-            old_df = pd.read_csv(LEDGER_FILE)
-            old_df = old_df[old_df["Ticker"].isin(active_tickers)]
-            old_df = old_df[~old_df["Status"].astype(str).str.startswith("OPEN")]
-            if "Base_1L_PnL" not in old_df.columns:
-                old_df["Base_1L_PnL"] = np.nan
-            combined_df = pd.concat([old_df, new_df], ignore_index=True)
-            combined_df.drop_duplicates(
-                subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True
-            )
-        else:
-            combined_df = new_df
+    if new_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), missing_feeds
 
-        combined_df = apply_adaptive_conviction_sizing(combined_df)
-        combined_df.to_csv(LEDGER_FILE, index=False)
-
-        today_df = combined_df[combined_df["Date"] == today_str]
-        send_telegram_summary(today_str, today_df, combined_df, missing_feeds)
-        print(f"Saved {roster_count}-stock {LOOKBACK_DAYS}d adaptive ledger! Total trades: {len(combined_df)} (Today {today_str}: {len(today_df)} trades). Net PnL: INR {combined_df['Net_PnL_INR'].sum():,.2f}")
+    if os.path.exists(LEDGER_FILE):
+        old_df = pd.read_csv(LEDGER_FILE)
+        old_df = old_df[old_df["Ticker"].isin(active_tickers)]
+        old_df = old_df[~old_df["Status"].astype(str).str.startswith("OPEN")]
+        if "Base_1L_PnL" not in old_df.columns:
+            old_df["Base_1L_PnL"] = np.nan
+        combined_df = pd.concat([old_df, new_df], ignore_index=True)
+        combined_df.drop_duplicates(subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True)
     else:
-        print("No trades generated across watchlist.")
+        combined_df = new_df
+
+    combined_df = apply_adaptive_conviction_sizing(combined_df)
+    combined_df.to_csv(LEDGER_FILE, index=False)
+    today_df = combined_df[combined_df["Date"] == today_str]
+    return today_df, combined_df, missing_feeds
+
+
+def run_continuous_live_loop():
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    roster_count = len(WATCHLIST)
+    print(f"=== Starting Continuous Shadow-Live Engine ({roster_count} Stocks) for {today_str} ===")
+
+    smart_api = get_angel_session()
+    scrip_df = load_token_map()
+
+    # Step 1: Pre-Market 99-Day Historical Baseline Cache
+    token_cache = {}
+    historical_trades = []
+    missing_feeds = []
+    for item in WATCHLIST:
+        sym, exch = item["symbol"], item["exchange"]
+        t_key = f"{sym}.{exch}"
+        token = resolve_token(scrip_df, item)
+        if not token:
+            missing_feeds.append(t_key)
+            continue
+        token_cache[t_key] = (sym, exch, token)
+        candles_99d = fetch_5m_candles(smart_api, exch, token, days_back=LOOKBACK_DAYS)
+        if not candles_99d.empty:
+            sim_t = simulate_orvwb_v6(candles_99d, sym, exch)
+            historical_trades.extend([t for t in sim_t if t["Date"] != today_str])
+            print(f"Pre-loaded 99d history for {t_key}: {len(sim_t)} historical setups.")
+        else:
+            missing_feeds.append(t_key)
+
+    now_ist = datetime.now(IST)
+    # If started outside market hours (e.g. weekend or after 15:20 IST), run a single verification pass and exit cleanly
+    if now_ist.weekday() >= 5 or now_ist.strftime("%H:%M") >= "15:20":
+        print("Outside live weekday market hours. Running single verification pass...")
+        today_df, combined_df, mf = run_single_pass(smart_api, scrip_df, today_str)
+        if not combined_df.empty:
+            send_telegram_summary(today_str, today_df, combined_df, mf)
+        return
+
+    send_telegram_text(
+        f"🟢 *ORVWB v6 Shadow-Live Engine Armed ({today_str})*\n"
+        f"• *Active Watchlist:* {len(token_cache)} Institutional Leaders\n"
+        f"• *Mode:* Continuous 5-Minute Live Polling (`09:30` – `15:15 IST`)"
+    )
+
+    alerted_states = {}  # Tracks {ticker: status} so Telegram only fires when a trade triggers or changes state
+    active_tickers = {f"{item['symbol']}.{item['exchange']}" for item in WATCHLIST}
+
+    while True:
+        now_ist = datetime.now(IST)
+        hm_str = now_ist.strftime("%H:%M")
+
+        # Wait until 09:35:02 IST (when the first 09:30 breakout candle finishes forming)
+        if hm_str < "09:35":
+            target_935 = now_ist.replace(hour=9, minute=35, second=2, microsecond=0)
+            wait_s = max((target_935 - now_ist).total_seconds(), 1.0)
+            print(f"[{now_ist.strftime('%H:%M:%S')}] Waiting {wait_s:.0f}s for 09:35:02 IST first breakout candle close...")
+            time.sleep(min(wait_s, 30.0))
+            continue
+
+        # Refresh Angel One session at 12:30 IST to ensure token stays fresh all afternoon
+        if hm_str == "12:30" and now_ist.second < 15:
+            try:
+                smart_api = get_angel_session()
+            except Exception as e:
+                print(f"Midday session refresh warning: {e}")
+
+        # Fast 5-Day Intraday Poll across all 16 stocks (~7 seconds total)
+        today_live_trades = []
+        for t_key, (sym, exch, token) in token_cache.items():
+            candles_5d = fetch_5m_candles(smart_api, exch, token, days_back=5)
+            if candles_5d.empty:
+                continue
+            sim_recent = simulate_orvwb_v6(candles_5d, sym, exch)
+            today_t = [t for t in sim_recent if t["Date"] == today_str]
+            today_live_trades.extend(today_t)
+
+        all_trades = historical_trades + today_live_trades
+        new_df = pd.DataFrame(all_trades)
+        if not new_df.empty:
+            if os.path.exists(LEDGER_FILE):
+                old_df = pd.read_csv(LEDGER_FILE)
+                old_df = old_df[old_df["Ticker"].isin(active_tickers)]
+                old_df = old_df[old_df["Date"] != today_str]
+                old_df = old_df[~old_df["Status"].astype(str).str.startswith("OPEN")]
+                if "Base_1L_PnL" not in old_df.columns:
+                    old_df["Base_1L_PnL"] = np.nan
+                combined_df = pd.concat([old_df, new_df], ignore_index=True)
+                combined_df.drop_duplicates(subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True)
+            else:
+                combined_df = new_df
+
+            combined_df = apply_adaptive_conviction_sizing(combined_df)
+            combined_df.to_csv(LEDGER_FILE, index=False)
+            today_df = combined_df[combined_df["Date"] == today_str]
+
+            # Check for any NEW trade entry or status transition (e.g. OPEN -> TP1 Hit or Stop Loss or Full TP2)
+            new_events = []
+            for _, r in today_df.iterrows():
+                t_k = f"{r['Ticker']}_{r['Entry_Time']}"
+                cur_status = str(r["Status"])
+                if alerted_states.get(t_k) != cur_status:
+                    alerted_states[t_k] = cur_status
+                    new_events.append(
+                        f"⚡ *Live Signal Update ({hm_str} IST)*\n"
+                        f"• `{r['Ticker']}` [{r['Conviction']}] ({r['Side']} @ {r['Entry_Time']})\n"
+                        f"• *Entry:* ₹{r['Entry_Price']} | *SL:* ₹{r['Stop_Loss']} | *TP2:* ₹{r['Target_2.5R']}\n"
+                        f"• *Current Status:* `{cur_status}` ({r['Result_R']:+.2f}R | ₹{r['Net_PnL_INR']:+.2f})"
+                    )
+            if new_events:
+                send_telegram_text("\n\n".join(new_events))
+
+        if hm_str >= "15:15":
+            print("15:15 IST EOD Square-Off reached. Sending final Command Report...")
+            today_df = combined_df[combined_df["Date"] == today_str] if not new_df.empty else pd.DataFrame()
+            send_telegram_summary(today_str, today_df, combined_df, missing_feeds)
+            break
+
+        # Sleep until 2 seconds after the next 5-minute candle boundary (e.g., 09:40:02, 09:45:02, etc.)
+        now_ist = datetime.now(IST)
+        next_min = (now_ist.minute // 5 + 1) * 5
+        if next_min >= 60:
+            next_run = (now_ist + timedelta(hours=1)).replace(minute=0, second=2, microsecond=0)
+        else:
+            next_run = now_ist.replace(minute=next_min, second=2, microsecond=0)
+        sleep_secs = max((next_run - now_ist).total_seconds(), 2.0)
+        print(f"[{now_ist.strftime('%H:%M:%S')}] Scan complete. Today trades: {len(today_live_trades)}. Sleeping {sleep_secs:.1f}s until {next_run.strftime('%H:%M:%S')} IST...")
+        time.sleep(sleep_secs)
+
+
+if __name__ == "__main__":
+    if "--live-loop" in sys.argv:
+        run_continuous_live_loop()
+    else:
+        today_str = datetime.now(IST).strftime("%Y-%m-%d")
+        print(f"=== Running ORVWB v6 Single-Pass Bot ({len(WATCHLIST)} Stocks) for {today_str} ===")
+        smart_api = get_angel_session()
+        scrip_df = load_token_map()
+        today_df, combined_df, missing_feeds = run_single_pass(smart_api, scrip_df, today_str)
+        if not combined_df.empty:
+            send_telegram_summary(today_str, today_df, combined_df, missing_feeds)
