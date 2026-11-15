@@ -10,11 +10,13 @@ import pyotp
 from SmartApi import SmartConnect
 
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
+SCREENER_FILE = "ORVWB_Screener_Ranked.csv"
 IST = timezone(timedelta(hours=5, minutes=30))
 LOOKBACK_DAYS = 99
+MIN_SHARE_PRICE = 100.0
 
-# 16-Stock Institutional Portfolio (All 16 Quality-Gate PASS Leaders > ₹100/share)
-WATCHLIST = [
+# Fallback 16-Stock Institutional Portfolio (Used if Screener CSV is missing or incomplete)
+DEFAULT_WATCHLIST = [
     {"symbol": "POLICYBZR", "exchange": "NSE", "token": None},
     {"symbol": "MCX", "exchange": "NSE", "token": None},
     {"symbol": "JINDALSTEL", "exchange": "NSE", "token": None},
@@ -32,6 +34,43 @@ WATCHLIST = [
     {"symbol": "ICICIBANK", "exchange": "NSE", "token": None},
     {"symbol": "PARAS", "exchange": "NSE", "token": None},
 ]
+
+
+def load_dynamic_watchlist(default_list: list, min_stocks: int = 8, max_stocks: int = 16) -> list:
+    """Automatically loads top Quality-Gate PASS stocks from ORVWB_Screener_Ranked.csv with circuit breakers."""
+    if not os.path.exists(SCREENER_FILE):
+        return default_list
+    try:
+        scr = pd.read_csv(SCREENER_FILE)
+        if scr.empty or "Quality_Gate" not in scr.columns:
+            return default_list
+
+        passed = scr[
+            (scr["Quality_Gate"] == "PASS")
+            & (scr["Profit_Factor"] >= 1.50)
+            & (scr["Win_Rate_Pct"] >= 52.5)
+            & (scr["Recent_45d_PnL_INR"] > 0)
+            & (scr["Recent_30d_PnL_INR"] >= 0)
+            & (~scr["Ticker"].astype(str).str.startswith("IDEA."))
+        ].head(max_stocks)
+
+        if len(passed) < min_stocks:
+            print(f"⚠️ Screener has only {len(passed)} passing stocks (< {min_stocks}). Using fallback watchlist.")
+            return default_list
+
+        dynamic_list = []
+        for ticker_str in passed["Ticker"].astype(str):
+            if "." in ticker_str:
+                sym, exch = ticker_str.split(".", 1)
+                dynamic_list.append({"symbol": sym.strip(), "exchange": exch.strip(), "token": None})
+
+        return dynamic_list if len(dynamic_list) >= min_stocks else default_list
+    except Exception as e:
+        print(f"⚠️ Error loading dynamic watchlist ({e}). Using fallback watchlist.")
+        return default_list
+
+
+WATCHLIST = load_dynamic_watchlist(DEFAULT_WATCHLIST)
 
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
 CAPITAL_PER_TRADE = 100000.0
@@ -248,6 +287,10 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
                     break
 
             if pos == 0 and entry_time is None and t_str <= entry_end:
+                # Hard Penny-Stock Guard: Never trigger entries below ₹100/share
+                if c < MIN_SHARE_PRICE:
+                    continue
+
                 bar_range = max(h - l, 0.05)
                 body_pct = abs(c - o) / bar_range
 
@@ -291,7 +334,7 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
             exit_reason = "OPEN (TP1 Hit, Trailing)" if tp1_hit else "OPEN (Floating)"
 
         if entry_time is not None and exit_reason != "":
-            qty = int(CAPITAL_PER_TRADE // entry_price)
+            qty = max(int(CAPITAL_PER_TRADE // entry_price), 1)
             gross_pnl = realized_r * init_risk * qty
             fees = CAPITAL_PER_TRADE * COMMISSION_PCT * 2
             base_pnl = round(gross_pnl - fees, 2)
@@ -425,7 +468,7 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
 if __name__ == "__main__":
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
     roster_count = len(WATCHLIST)
-    print(f"=== Running ORVWB v6 Master Bot ({roster_count} Stocks | {LOOKBACK_DAYS}d Lookback) for IST Date: {today_str} ===")
+    print(f"=== Running ORVWB v6 Master Bot ({roster_count} Dynamic Stocks | {LOOKBACK_DAYS}d Lookback) for IST Date: {today_str} ===")
     smart_api = get_angel_session()
     scrip_df = load_token_map()
     all_new_trades = []
