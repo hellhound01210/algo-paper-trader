@@ -508,17 +508,26 @@ def run_single_pass(smart_api, scrip_df: pd.DataFrame, today_str: str) -> tuple:
 
 
 def run_continuous_live_loop():
-    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    now_ist = datetime.now(IST)
+    today_str = now_ist.strftime("%Y-%m-%d")
     roster_count = len(WATCHLIST)
+
+    # Guard against late backup cron jobs starting after the 15:15 IST session has already completed
+    if now_ist.weekday() < 5 and now_ist.strftime("%H:%M") >= "15:16":
+        print(f"Session for {today_str} already closed (>= 15:16 IST). Exiting backup cron cleanly.")
+        return
+
     print(f"=== Starting Continuous Shadow-Live Engine ({roster_count} Stocks) for {today_str} ===")
 
     smart_api = get_angel_session()
     scrip_df = load_token_map()
 
-    # Step 1: Pre-Market 99-Day Historical Baseline Cache
+    # Step 1: Pre-Market 99-Day Historical Baseline Cache + Initial Today Cache
     token_cache = {}
     historical_trades = []
+    today_trade_cache = {}  # Persistent intraday RAM cache so EOD API timeouts never drop morning trades
     missing_feeds = []
+
     for item in WATCHLIST:
         sym, exch = item["symbol"], item["exchange"]
         t_key = f"{sym}.{exch}"
@@ -531,14 +540,16 @@ def run_continuous_live_loop():
         if not candles_99d.empty:
             sim_t = simulate_orvwb_v6(candles_99d, sym, exch)
             historical_trades.extend([t for t in sim_t if t["Date"] != today_str])
-            print(f"Pre-loaded 99d history for {t_key}: {len(sim_t)} historical setups.")
+            today_init = [t for t in sim_t if t["Date"] == today_str]
+            if today_init:
+                today_trade_cache[t_key] = today_init
+            print(f"Pre-loaded 99d history for {t_key}: {len(sim_t)} setups.")
         else:
             missing_feeds.append(t_key)
 
     now_ist = datetime.now(IST)
-    # If started outside market hours (e.g. weekend or after 15:20 IST), run a single verification pass and exit cleanly
-    if now_ist.weekday() >= 5 or now_ist.strftime("%H:%M") >= "15:20":
-        print("Outside live weekday market hours. Running single verification pass...")
+    if now_ist.weekday() >= 5:
+        print("Weekend run detected. Running single verification pass...")
         today_df, combined_df, mf = run_single_pass(smart_api, scrip_df, today_str)
         if not combined_df.empty:
             send_telegram_summary(today_str, today_df, combined_df, mf)
@@ -550,14 +561,13 @@ def run_continuous_live_loop():
         f"• *Mode:* Continuous 5-Minute Live Polling (`09:30` – `15:15 IST`)"
     )
 
-    alerted_states = {}  # Tracks {ticker: status} so Telegram only fires when a trade triggers or changes state
+    alerted_states = {}
     active_tickers = {f"{item['symbol']}.{item['exchange']}" for item in WATCHLIST}
 
     while True:
         now_ist = datetime.now(IST)
         hm_str = now_ist.strftime("%H:%M")
 
-        # Wait until 09:35:02 IST (when the first 09:30 breakout candle finishes forming)
         if hm_str < "09:35":
             target_935 = now_ist.replace(hour=9, minute=35, second=2, microsecond=0)
             wait_s = max((target_935 - now_ist).total_seconds(), 1.0)
@@ -565,22 +575,25 @@ def run_continuous_live_loop():
             time.sleep(min(wait_s, 30.0))
             continue
 
-        # Refresh Angel One session at 12:30 IST to ensure token stays fresh all afternoon
         if hm_str == "12:30" and now_ist.second < 15:
             try:
                 smart_api = get_angel_session()
             except Exception as e:
                 print(f"Midday session refresh warning: {e}")
 
-        # Fast 5-Day Intraday Poll across all 16 stocks (~7 seconds total)
-        today_live_trades = []
+        # Fast 5-Day Intraday Poll across all 16 stocks with Persistent Intraday Cache
         for t_key, (sym, exch, token) in token_cache.items():
             candles_5d = fetch_5m_candles(smart_api, exch, token, days_back=5)
             if candles_5d.empty:
                 continue
             sim_recent = simulate_orvwb_v6(candles_5d, sym, exch)
             today_t = [t for t in sim_recent if t["Date"] == today_str]
-            today_live_trades.extend(today_t)
+            if today_t:
+                today_trade_cache[t_key] = today_t
+
+        today_live_trades = []
+        for cached_list in today_trade_cache.values():
+            today_live_trades.extend(cached_list)
 
         all_trades = historical_trades + today_live_trades
         new_df = pd.DataFrame(all_trades)
@@ -601,7 +614,6 @@ def run_continuous_live_loop():
             combined_df.to_csv(LEDGER_FILE, index=False)
             today_df = combined_df[combined_df["Date"] == today_str]
 
-            # Check for any NEW trade entry or status transition (e.g. OPEN -> TP1 Hit or Stop Loss or Full TP2)
             new_events = []
             for _, r in today_df.iterrows():
                 t_k = f"{r['Ticker']}_{r['Entry_Time']}"
@@ -623,7 +635,6 @@ def run_continuous_live_loop():
             send_telegram_summary(today_str, today_df, combined_df, missing_feeds)
             break
 
-        # Sleep until 2 seconds after the next 5-minute candle boundary (e.g., 09:40:02, 09:45:02, etc.)
         now_ist = datetime.now(IST)
         next_min = (now_ist.minute // 5 + 1) * 5
         if next_min >= 60:
