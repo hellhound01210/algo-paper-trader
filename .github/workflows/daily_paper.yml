@@ -2,9 +2,17 @@ name: ORVWB v6 Continuous Shadow-Live Trader
 
 on:
   schedule:
-    # Wakes up at 09:20 IST (03:50 UTC) Monday-Friday and runs continuously until 15:18 IST
-    - cron: '50 3 * * 1-5'
+    # 4 Staggered Morning Wake-Up Crons to beat GitHub Actions queue drops (UTC = IST - 5h30m)
+    - cron: '25 3 * * 1-5'   # 08:55 IST (Early Bird Wake-Up)
+    - cron: '40 3 * * 1-5'   # 09:10 IST (Primary Pre-Market Wake-Up)
+    - cron: '50 3 * * 1-5'   # 09:20 IST (Backup Wake-Up 1)
+    - cron: '2 4 * * 1-5'    # 09:32 IST (Backup Wake-Up 2)
   workflow_dispatch:
+
+# Prevents duplicate runs (#100 vs #101 collision): once 1 run starts, later crons are skipped
+concurrency:
+  group: orvwb-shadow-live-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -12,9 +20,13 @@ permissions:
 jobs:
   shadow-live-trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 390
 
     steps:
+      - name: Exit immediately if a run already completed today
+        run: |
+          echo "Starting ORVWB v6 Continuous Session..."
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -29,7 +41,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy pyotp smartapi-python websocket-client logzero
 
-      - name: Run Continuous Intraday Shadow-Live Loop (09:20 - 15:18 IST)
+      - name: Run Continuous Intraday Shadow-Live Loop
         env:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
