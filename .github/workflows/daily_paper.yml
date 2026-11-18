@@ -2,16 +2,14 @@ name: ORVWB v6 Continuous Shadow-Live Trader
 
 on:
   schedule:
-    # 4 Staggered Morning Wake-Up Crons to beat GitHub Actions queue drops (UTC = IST - 5h30m)
-    - cron: '25 3 * * 1-5'   # 08:55 IST (Early Bird Wake-Up)
-    - cron: '40 3 * * 1-5'   # 09:10 IST (Primary Pre-Market Wake-Up)
-    - cron: '50 3 * * 1-5'   # 09:20 IST (Backup Wake-Up 1)
-    - cron: '2 4 * * 1-5'    # 09:32 IST (Backup Wake-Up 2)
+    # Single early morning cron (07:55 IST = 02:25 UTC). 
+    # GitHub naturally queues morning runs by ~45-50 mins, booting your runner right around 08:45 - 09:05 IST.
+    - cron: '25 2 * * 1-5'
   workflow_dispatch:
 
-# Prevents duplicate runs (#100 vs #101 collision): once 1 run starts, later crons are skipped
+# Prevents duplicate overlapping runs (#104, #105, etc.): if a run is active, any duplicate is blocked.
 concurrency:
-  group: orvwb-shadow-live-${{ github.ref }}
+  group: orvwb-shadow-live-trader
   cancel-in-progress: false
 
 permissions:
@@ -23,10 +21,6 @@ jobs:
     timeout-minutes: 390
 
     steps:
-      - name: Exit immediately if a run already completed today
-        run: |
-          echo "Starting ORVWB v6 Continuous Session..."
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
