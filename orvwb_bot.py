@@ -512,9 +512,14 @@ def run_continuous_live_loop():
     today_str = now_ist.strftime("%Y-%m-%d")
     roster_count = len(WATCHLIST)
 
-    # Guard against late backup cron jobs starting after the 15:15 IST session has already completed
+    # If triggered after 15:16 IST (e.g., manual EOD reconciliation), run a single pass to settle open trades
     if now_ist.weekday() < 5 and now_ist.strftime("%H:%M") >= "15:16":
-        print(f"Session for {today_str} already closed (>= 15:16 IST). Exiting backup cron cleanly.")
+        print(f"Post-close run detected (>= 15:16 IST) for {today_str}. Running EOD reconciliation pass...")
+        smart_api = get_angel_session()
+        scrip_df = load_token_map()
+        today_df, combined_df, mf = run_single_pass(smart_api, scrip_df, today_str)
+        if not combined_df.empty:
+            send_telegram_summary(today_str, today_df, combined_df, mf)
         return
 
     print(f"=== Starting Continuous Shadow-Live Engine ({roster_count} Stocks) for {today_str} ===")
