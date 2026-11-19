@@ -2,12 +2,13 @@ name: ORVWB v6 Continuous Shadow-Live Trader
 
 on:
   schedule:
-    # Single early morning cron (07:55 IST = 02:25 UTC). 
-    # GitHub naturally queues morning runs by ~45-50 mins, booting your runner right around 08:45 - 09:05 IST.
-    - cron: '25 2 * * 1-5'
+    # Single morning cron (08:35 IST = 03:05 UTC).
+    # With GitHub's ~45-min morning queue delay, the runner boots around 09:20 IST,
+    # keeping the 6-hour GitHub Actions job limit safely past the 15:15 IST close.
+    - cron: '05 3 * * 1-5'
   workflow_dispatch:
 
-# Prevents duplicate overlapping runs (#104, #105, etc.): if a run is active, any duplicate is blocked.
+# Prevents duplicate overlapping runs: if a run is active, any duplicate is blocked.
 concurrency:
   group: orvwb-shadow-live-trader
   cancel-in-progress: false
@@ -18,7 +19,7 @@ permissions:
 jobs:
   shadow-live-trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 390
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
