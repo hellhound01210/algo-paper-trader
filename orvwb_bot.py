@@ -21,7 +21,7 @@ LIVE_ORDER_EXECUTION = False
 
 # Realistic Friction & Capital Settings
 CAPITAL_PER_TRADE = 100000.0
-LIVE_START_CAPITAL_1X = 20000.0
+LIVE_START_CAPITAL_1X = 50000.0
 SLIPPAGE_PER_SIDE = 0.0005  # 0.05% per side = 0.10% round-trip slippage
 
 # Fallback 16-Stock Institutional Portfolio
@@ -401,7 +401,7 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
             side_str = "LONG" if (tp2_price > entry_price) else "SHORT"
             per_share_gross = realized_r * init_risk
             base_pnl = compute_real_trade_pnl(entry_price, per_share_gross, side_str, exchange, exit_reason, CAPITAL_PER_TRADE)
-            pnl_20k = compute_real_trade_pnl(entry_price, per_share_gross, side_str, exchange, exit_reason, LIVE_START_CAPITAL_1X)
+            pnl_50k = compute_real_trade_pnl(entry_price, per_share_gross, side_str, exchange, exit_reason, LIVE_START_CAPITAL_1X)
             trades.append({
                 "Date": str(trade_date),
                 "Ticker": f"{symbol}.{exchange}",
@@ -415,7 +415,7 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
                 "Result_R": round(realized_r, 2),
                 "Base_1L_PnL": base_pnl,
                 "Net_PnL_INR": base_pnl,
-                "Net_PnL_20k_1x": pnl_20k,
+                "Net_PnL_50k_1x": pnl_50k,
                 "Status": exit_reason,
             })
     return trades
@@ -425,6 +425,10 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.sort_values(by=["Date", "Entry_Time"]).reset_index(drop=True)
+
+    # Drop legacy 20k column if upgrading from an older ledger CSV
+    if "Net_PnL_20k_1x" in df.columns:
+        df.drop(columns=["Net_PnL_20k_1x"], inplace=True)
 
     # Recompute exact realistic friction (Angel One brokerage + taxes + 0.10% RT slippage) across all rows
     init_risk = (df["Target_2.5R"] - df["Entry_Price"]).abs() / 2.5
@@ -479,7 +483,7 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
     trade_cap = scores.map(CONVICTION_CAP_MAP)
 
     net_adap_list = []
-    net_20k_list = []
+    net_50k_list = []
     for idx, r in df.iterrows():
         exch = "BSE" if ".BSE" in str(r["Ticker"]) else "NSE"
         net_adap_list.append(
@@ -492,7 +496,7 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
                 float(trade_cap.loc[idx]),
             )
         )
-        net_20k_list.append(
+        net_50k_list.append(
             compute_real_trade_pnl(
                 float(r["Entry_Price"]),
                 float(per_share_gross.loc[idx]),
@@ -504,7 +508,7 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     df["Net_PnL_INR"] = net_adap_list
-    df["Net_PnL_20k_1x"] = net_20k_list
+    df["Net_PnL_50k_1x"] = net_50k_list
     return df
 
 
@@ -524,7 +528,7 @@ def send_telegram_text(msg: str):
 def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: pd.DataFrame, missing_feeds: list):
     roster_count = len(WATCHLIST)
     total_pnl = combined_df["Net_PnL_INR"].sum() if not combined_df.empty else 0.0
-    total_20k = combined_df["Net_PnL_20k_1x"].sum() if (not combined_df.empty and "Net_PnL_20k_1x" in combined_df.columns) else 0.0
+    total_50k = combined_df["Net_PnL_50k_1x"].sum() if (not combined_df.empty and "Net_PnL_50k_1x" in combined_df.columns) else 0.0
     win_rate = (combined_df["Net_PnL_INR"] > 0).mean() * 100 if not combined_df.empty else 0.0
     gw = combined_df[combined_df["Net_PnL_INR"] > 0]["Net_PnL_INR"].sum() if not combined_df.empty else 0.0
     gl = abs(combined_df[combined_df["Net_PnL_INR"] <= 0]["Net_PnL_INR"].sum()) if not combined_df.empty else 0.0
@@ -543,21 +547,21 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
     else:
         for _, r in today_df.iterrows():
             tier_str = r.get("Conviction", "Tier A")
-            pnl_20k_val = r.get("Net_PnL_20k_1x", 0.0)
+            pnl_50k_val = r.get("Net_PnL_50k_1x", 0.0)
             lines.append(
                 f"• `{r['Ticker']}` [{tier_str}] ({r['Side']} @ {r['Entry_Time']} | Entry: ₹{r['Entry_Price']} | SL: ₹{r['Stop_Loss']}): "
-                f"{r['Result_R']:+.2f}R | ₹{r['Net_PnL_INR']:+.2f} (20k 1x: ₹{pnl_20k_val:+.2f}) [{r['Status']}]"
+                f"{r['Result_R']:+.2f}R | ₹{r['Net_PnL_INR']:+.2f} (50k 1x: ₹{pnl_50k_val:+.2f}) [{r['Status']}]"
             )
         lines.append(
             f"• *Today's Net PnL (₹1L Adap):* ₹{today_df['Net_PnL_INR'].sum():+,.2f}\n"
-            f"• *Today's Net PnL (₹20k 1x):* ₹{today_df['Net_PnL_20k_1x'].sum():+,.2f}"
+            f"• *Today's Net PnL (₹50k 1x):* ₹{today_df['Net_PnL_50k_1x'].sum():+,.2f}"
         )
 
     lines.append(
         f"\n📈 *99d Real-World Ledger Telemetry ({roster_count} Stocks):*\n"
         f"• *Total Trades:* {len(combined_df)} | *Win Rate:* {win_rate:.1f}% | *PF:* {pf:.2f}\n"
         f"• *Cumulative Net (₹1L Adap):* ₹{total_pnl:,.2f} | *Max DD:* ₹{max_dd:,.2f}\n"
-        f"• *Cumulative Net (₹20k 1x):* ₹{total_20k:,.2f}"
+        f"• *Cumulative Net (₹50k 1x):* ₹{total_50k:,.2f}"
     )
 
     if missing_feeds:
@@ -594,8 +598,8 @@ def run_single_pass(smart_api, scrip_df: pd.DataFrame, today_str: str) -> tuple:
         old_df = old_df[~old_df["Status"].astype(str).str.startswith("OPEN")]
         if "Base_1L_PnL" not in old_df.columns:
             old_df["Base_1L_PnL"] = np.nan
-        if "Net_PnL_20k_1x" not in old_df.columns:
-            old_df["Net_PnL_20k_1x"] = np.nan
+        if "Net_PnL_50k_1x" not in old_df.columns:
+            old_df["Net_PnL_50k_1x"] = np.nan
         combined_df = pd.concat([old_df, new_df], ignore_index=True)
         combined_df.drop_duplicates(subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True)
     else:
@@ -711,8 +715,8 @@ def run_continuous_live_loop():
                 old_df = old_df[~old_df["Status"].astype(str).str.startswith("OPEN")]
                 if "Base_1L_PnL" not in old_df.columns:
                     old_df["Base_1L_PnL"] = np.nan
-                if "Net_PnL_20k_1x" not in old_df.columns:
-                    old_df["Net_PnL_20k_1x"] = np.nan
+                if "Net_PnL_50k_1x" not in old_df.columns:
+                    old_df["Net_PnL_50k_1x"] = np.nan
                 combined_df = pd.concat([old_df, new_df], ignore_index=True)
                 combined_df.drop_duplicates(subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True)
             else:
@@ -732,7 +736,7 @@ def run_continuous_live_loop():
                         f"⚡ *Live Signal Update ({hm_str} IST)*\n"
                         f"• `{r['Ticker']}` [{r['Conviction']}] ({r['Side']} @ {r['Entry_Time']})\n"
                         f"• *Entry:* ₹{r['Entry_Price']} | *SL:* ₹{r['Stop_Loss']} | *TP2:* ₹{r['Target_2.5R']}\n"
-                        f"• *Current Status:* `{cur_status}` ({r['Result_R']:+.2f}R | ₹{r['Net_PnL_INR']:+.2f} | 20k 1x: ₹{r['Net_PnL_20k_1x']:+.2f})"
+                        f"• *Current Status:* `{cur_status}` ({r['Result_R']:+.2f}R | ₹{r['Net_PnL_INR']:+.2f} | 50k 1x: ₹{r['Net_PnL_50k_1x']:+.2f})"
                     )
             if new_events:
                 send_telegram_text("\n\n".join(new_events))
