@@ -16,6 +16,9 @@ IST = timezone(timedelta(hours=5, minutes=30))
 LOOKBACK_DAYS = 99
 MIN_SHARE_PRICE = 100.0
 
+# Immutable Paper-Trading Window Start Date (prevents survivorship & lookahead bias across screener rotations)
+PAPER_TRADE_START_DATE = "2026-11-10"
+
 # Master Switch: Keep False during 60-Trading-Day Shadow-Live Testing!
 LIVE_ORDER_EXECUTION = False
 
@@ -147,6 +150,54 @@ def compute_real_trade_pnl(
     charges = calculate_angel_one_charges(buy_val, sell_val, exchange, orders)
     slippage = (buy_val + sell_val) * SLIPPAGE_PER_SIDE
     return round(gross_pnl - charges - slippage, 2)
+
+
+def merge_ledger_with_paper_lock(
+    new_df: pd.DataFrame, active_tickers: set, today_str: str
+) -> pd.DataFrame:
+    """
+    Merges newly simulated trades with existing ledger while locking all closed
+    live paper trades (>= PAPER_TRADE_START_DATE):
+    - Never deletes rotated-out tickers from the paper-trading window.
+    - Never retroactively injects newly added tickers into past paper-trading dates.
+    - Allows pre-paper backtest history (< PAPER_TRADE_START_DATE), today's live trades,
+      and any prior dates with leftover OPEN rows to refresh cleanly.
+    """
+    if not os.path.exists(LEDGER_FILE):
+        return new_df.copy()
+
+    old_df = pd.read_csv(LEDGER_FILE)
+    if old_df.empty:
+        return new_df.copy()
+
+    if "Base_1L_PnL" not in old_df.columns:
+        old_df["Base_1L_PnL"] = np.nan
+    if "Net_PnL_50k_1x" not in old_df.columns:
+        old_df["Net_PnL_50k_1x"] = np.nan
+
+    old_dates = old_df["Date"].astype(str)
+    old_is_open = old_df["Status"].astype(str).str.startswith("OPEN")
+    open_dates = set(old_dates[old_is_open])
+
+    is_locked_paper = (old_dates >= PAPER_TRADE_START_DATE) & (old_dates != today_str) & (~old_is_open)
+    is_active_backtest = (old_dates < PAPER_TRADE_START_DATE) & (old_df["Ticker"].isin(active_tickers))
+    kept_old = old_df[is_locked_paper | is_active_backtest].copy()
+
+    has_locked_paper = (old_dates >= PAPER_TRADE_START_DATE).any()
+    if has_locked_paper and not new_df.empty:
+        new_dates = new_df["Date"].astype(str)
+        allowed_new = (
+            (new_dates < PAPER_TRADE_START_DATE)
+            | (new_dates == today_str)
+            | (new_dates.isin(open_dates))
+        )
+        filtered_new = new_df[allowed_new].copy()
+    else:
+        filtered_new = new_df.copy()
+
+    combined_df = pd.concat([kept_old, filtered_new], ignore_index=True)
+    combined_df.drop_duplicates(subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True)
+    return combined_df
 
 
 def get_angel_session():
@@ -557,8 +608,25 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
             f"• *Today's Net PnL (₹50k 1x):* ₹{today_df['Net_PnL_50k_1x'].sum():+,.2f}"
         )
 
+    # Dedicated Locked Paper-Trading Window Telemetry
+    if not combined_df.empty:
+        paper_df = combined_df[combined_df["Date"].astype(str) >= PAPER_TRADE_START_DATE]
+        if not paper_df.empty:
+            p_days = paper_df["Date"].nunique()
+            p_wr = (paper_df["Net_PnL_INR"] > 0).mean() * 100
+            p_gw = paper_df[paper_df["Net_PnL_INR"] > 0]["Net_PnL_INR"].sum()
+            p_gl = abs(paper_df[paper_df["Net_PnL_INR"] <= 0]["Net_PnL_INR"].sum())
+            p_pf = (p_gw / p_gl) if p_gl > 0 else 99.0
+            p_1l = paper_df["Net_PnL_INR"].sum()
+            p_50k = paper_df["Net_PnL_50k_1x"].sum()
+            lines.append(
+                f"\n🔒 *Live Paper Window (Since {PAPER_TRADE_START_DATE} | {p_days}d):*\n"
+                f"• *Trades:* {len(paper_df)} | *WR:* {p_wr:.1f}% | *PF:* {p_pf:.2f}\n"
+                f"• *Net (₹1L Adap):* ₹{p_1l:+,.2f} | *Net (₹50k 1x):* ₹{p_50k:+,.2f}"
+            )
+
     lines.append(
-        f"\n📈 *99d Real-World Ledger Telemetry ({roster_count} Stocks):*\n"
+        f"\n📈 *99d Real-World Ledger Telemetry ({roster_count} Active Stocks):*\n"
         f"• *Total Trades:* {len(combined_df)} | *Win Rate:* {win_rate:.1f}% | *PF:* {pf:.2f}\n"
         f"• *Cumulative Net (₹1L Adap):* ₹{total_pnl:,.2f} | *Max DD:* ₹{max_dd:,.2f}\n"
         f"• *Cumulative Net (₹50k 1x):* ₹{total_50k:,.2f}"
@@ -592,19 +660,7 @@ def run_single_pass(smart_api, scrip_df: pd.DataFrame, today_str: str) -> tuple:
     if new_df.empty:
         return pd.DataFrame(), pd.DataFrame(), missing_feeds
 
-    if os.path.exists(LEDGER_FILE):
-        old_df = pd.read_csv(LEDGER_FILE)
-        old_df = old_df[old_df["Ticker"].isin(active_tickers)]
-        old_df = old_df[~old_df["Status"].astype(str).str.startswith("OPEN")]
-        if "Base_1L_PnL" not in old_df.columns:
-            old_df["Base_1L_PnL"] = np.nan
-        if "Net_PnL_50k_1x" not in old_df.columns:
-            old_df["Net_PnL_50k_1x"] = np.nan
-        combined_df = pd.concat([old_df, new_df], ignore_index=True)
-        combined_df.drop_duplicates(subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True)
-    else:
-        combined_df = new_df
-
+    combined_df = merge_ledger_with_paper_lock(new_df, active_tickers, today_str)
     combined_df = apply_adaptive_conviction_sizing(combined_df)
     combined_df.to_csv(LEDGER_FILE, index=False)
     today_df = combined_df[combined_df["Date"] == today_str]
@@ -667,7 +723,8 @@ def run_continuous_live_loop():
     send_telegram_text(
         f"🟢 *ORVWB v6 Shadow-Live Engine Armed ({today_str})*\n"
         f"• *Active Watchlist:* {len(token_cache)} Institutional Leaders\n"
-        f"• *Cost Model:* Exact Angel One Taxes + 0.10% RT Slippage\n"
+        f"• *Cost Model:* Exact Angel One Taxes + 0.10% RT Slippage (₹50k 1x)\n"
+        f"• *Paper Lock:* Immutable since `{PAPER_TRADE_START_DATE}`\n"
         f"• *Mode:* Continuous 5-Minute Live Polling (`09:30` – `15:15 IST`)"
     )
 
@@ -691,7 +748,7 @@ def run_continuous_live_loop():
             except Exception as e:
                 print(f"Midday session refresh warning: {e}")
 
-        # Fast 5-Day Intraday Poll across all 16 stocks with Persistent Intraday Cache
+        # Fast 5-Day Intraday Poll across all active stocks with Persistent Intraday Cache
         for t_key, (sym, exch, token) in token_cache.items():
             candles_5d = fetch_5m_candles(smart_api, exch, token, days_back=5)
             if candles_5d.empty:
@@ -708,20 +765,7 @@ def run_continuous_live_loop():
         all_trades = historical_trades + today_live_trades
         new_df = pd.DataFrame(all_trades)
         if not new_df.empty:
-            if os.path.exists(LEDGER_FILE):
-                old_df = pd.read_csv(LEDGER_FILE)
-                old_df = old_df[old_df["Ticker"].isin(active_tickers)]
-                old_df = old_df[old_df["Date"] != today_str]
-                old_df = old_df[~old_df["Status"].astype(str).str.startswith("OPEN")]
-                if "Base_1L_PnL" not in old_df.columns:
-                    old_df["Base_1L_PnL"] = np.nan
-                if "Net_PnL_50k_1x" not in old_df.columns:
-                    old_df["Net_PnL_50k_1x"] = np.nan
-                combined_df = pd.concat([old_df, new_df], ignore_index=True)
-                combined_df.drop_duplicates(subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True)
-            else:
-                combined_df = new_df
-
+            combined_df = merge_ledger_with_paper_lock(new_df, active_tickers, today_str)
             combined_df = apply_adaptive_conviction_sizing(combined_df)
             combined_df.to_csv(LEDGER_FILE, index=False)
             today_df = combined_df[combined_df["Date"] == today_str]
