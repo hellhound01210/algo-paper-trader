@@ -25,6 +25,7 @@ LIVE_ORDER_EXECUTION = False
 # Realistic Friction & Capital Settings
 CAPITAL_PER_TRADE = 100000.0
 LIVE_START_CAPITAL_1X = 50000.0
+MAX_DAILY_TRADES_CAP = 2
 SLIPPAGE_PER_SIDE = 0.0005  # 0.05% per side = 0.10% round-trip slippage
 
 # Fallback 16-Stock Institutional Portfolio
@@ -170,10 +171,9 @@ def merge_ledger_with_paper_lock(
     if old_df.empty:
         return new_df.copy()
 
-    if "Base_1L_PnL" not in old_df.columns:
-        old_df["Base_1L_PnL"] = np.nan
-    if "Net_PnL_50k_1x" not in old_df.columns:
-        old_df["Net_PnL_50k_1x"] = np.nan
+    for col in ("Base_1L_PnL", "Net_PnL_50k_1x", "Net_PnL_Max2_50k"):
+        if col not in old_df.columns:
+            old_df[col] = np.nan
 
     old_dates = old_df["Date"].astype(str)
     old_is_open = old_df["Status"].astype(str).str.startswith("OPEN")
@@ -467,6 +467,7 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
                 "Base_1L_PnL": base_pnl,
                 "Net_PnL_INR": base_pnl,
                 "Net_PnL_50k_1x": pnl_50k,
+                "Net_PnL_Max2_50k": pnl_50k,
                 "Status": exit_reason,
             })
     return trades
@@ -475,7 +476,7 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
 def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    df = df.sort_values(by=["Date", "Entry_Time"]).reset_index(drop=True)
+    df = df.sort_values(by=["Date", "Entry_Time", "Ticker"]).reset_index(drop=True)
 
     # Drop legacy 20k column if upgrading from an older ledger CSV
     if "Net_PnL_20k_1x" in df.columns:
@@ -560,7 +561,25 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
 
     df["Net_PnL_INR"] = net_adap_list
     df["Net_PnL_50k_1x"] = net_50k_list
+
+    # Parallel Max 2 Trades/Day @ ₹50k tracker (first 2 chronological setups each day)
+    day_seq = df.groupby("Date").cumcount() + 1
+    df["Net_PnL_Max2_50k"] = np.where(day_seq <= MAX_DAILY_TRADES_CAP, df["Net_PnL_50k_1x"], 0.0).round(2)
     return df
+
+
+def _calc_window_metrics(sub_df: pd.DataFrame, pnl_col: str) -> tuple:
+    if sub_df.empty:
+        return 0, 0.0, 0.0, 0.0, 0.0
+    n = len(sub_df)
+    wr = (sub_df[pnl_col] > 0).mean() * 100
+    gw = sub_df[sub_df[pnl_col] > 0][pnl_col].sum()
+    gl = abs(sub_df[sub_df[pnl_col] <= 0][pnl_col].sum())
+    pf = (gw / gl) if gl > 0 else 99.0
+    tot = float(sub_df[pnl_col].sum())
+    daily_eq = sub_df.groupby("Date")[pnl_col].sum().cumsum()
+    max_dd = float((daily_eq - daily_eq.cummax()).min())
+    return n, wr, pf, tot, max_dd
 
 
 def send_telegram_text(msg: str):
@@ -578,34 +597,33 @@ def send_telegram_text(msg: str):
 
 def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: pd.DataFrame, missing_feeds: list):
     roster_count = len(WATCHLIST)
-    total_pnl = combined_df["Net_PnL_INR"].sum() if not combined_df.empty else 0.0
+    _, win_rate, pf, total_pnl, max_dd = _calc_window_metrics(combined_df, "Net_PnL_INR")
     total_50k = combined_df["Net_PnL_50k_1x"].sum() if (not combined_df.empty and "Net_PnL_50k_1x" in combined_df.columns) else 0.0
-    win_rate = (combined_df["Net_PnL_INR"] > 0).mean() * 100 if not combined_df.empty else 0.0
-    gw = combined_df[combined_df["Net_PnL_INR"] > 0]["Net_PnL_INR"].sum() if not combined_df.empty else 0.0
-    gl = abs(combined_df[combined_df["Net_PnL_INR"] <= 0]["Net_PnL_INR"].sum()) if not combined_df.empty else 0.0
-    pf = (gw / gl) if gl > 0 else 99.0
 
-    max_dd = 0.0
     if not combined_df.empty:
-        daily_eq = combined_df.groupby("Date")["Net_PnL_INR"].sum().cumsum()
-        peak = daily_eq.cummax()
-        max_dd = float((daily_eq - peak).min())
+        full_seq = combined_df.groupby("Date").cumcount() + 1
+        full_cap2_df = combined_df[full_seq <= MAX_DAILY_TRADES_CAP]
+        c2_n, c2_wr, c2_pf, c2_tot, c2_dd = _calc_window_metrics(full_cap2_df, "Net_PnL_Max2_50k")
+    else:
+        c2_n, c2_wr, c2_pf, c2_tot, c2_dd = 0, 0.0, 0.0, 0.0, 0.0
 
     lines = [f"📊 *ORVWB v6 Command Report ({today_str})*"]
     lines.append("_(Net of Angel One Brokerage, Taxes & 0.10% RT Slippage)_")
     if today_df.empty:
         lines.append(f"• *Today's Action:* No setups triggered across the {roster_count}-stock watchlist today.")
     else:
-        for _, r in today_df.iterrows():
+        for slot_idx, (_, r) in enumerate(today_df.iterrows(), start=1):
             tier_str = r.get("Conviction", "Tier A")
             pnl_50k_val = r.get("Net_PnL_50k_1x", 0.0)
+            slot_tag = f"Slot #{slot_idx}/{MAX_DAILY_TRADES_CAP}" if slot_idx <= MAX_DAILY_TRADES_CAP else "Cap Skip"
             lines.append(
-                f"• `{r['Ticker']}` [{tier_str}] ({r['Side']} @ {r['Entry_Time']} | Entry: ₹{r['Entry_Price']} | SL: ₹{r['Stop_Loss']}): "
-                f"{r['Result_R']:+.2f}R | ₹{r['Net_PnL_INR']:+.2f} (50k 1x: ₹{pnl_50k_val:+.2f}) [{r['Status']}]"
+                f"• `{r['Ticker']}` [{tier_str} | {slot_tag}] ({r['Side']} @ {r['Entry_Time']} | Entry: ₹{r['Entry_Price']} | SL: ₹{r['Stop_Loss']}): "
+                f"{r['Result_R']:+.2f}R | ₹{r['Net_PnL_INR']:+.2f} (50k: ₹{pnl_50k_val:+.2f}) [{r['Status']}]"
             )
         lines.append(
-            f"• *Today's Net PnL (₹1L Adap):* ₹{today_df['Net_PnL_INR'].sum():+,.2f}\n"
-            f"• *Today's Net PnL (₹50k 1x):* ₹{today_df['Net_PnL_50k_1x'].sum():+,.2f}"
+            f"• *Today's Net (₹1L Adap):* ₹{today_df['Net_PnL_INR'].sum():+,.2f}\n"
+            f"• *Today's Net (₹50k All):* ₹{today_df['Net_PnL_50k_1x'].sum():+,.2f}\n"
+            f"• *Today's Net (Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k):* ₹{today_df['Net_PnL_Max2_50k'].sum():+,.2f}"
         )
 
     # Dedicated Locked Paper-Trading Window Telemetry
@@ -613,23 +631,23 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
         paper_df = combined_df[combined_df["Date"].astype(str) >= PAPER_TRADE_START_DATE]
         if not paper_df.empty:
             p_days = paper_df["Date"].nunique()
-            p_wr = (paper_df["Net_PnL_INR"] > 0).mean() * 100
-            p_gw = paper_df[paper_df["Net_PnL_INR"] > 0]["Net_PnL_INR"].sum()
-            p_gl = abs(paper_df[paper_df["Net_PnL_INR"] <= 0]["Net_PnL_INR"].sum())
-            p_pf = (p_gw / p_gl) if p_gl > 0 else 99.0
-            p_1l = paper_df["Net_PnL_INR"].sum()
+            p_n, p_wr, p_pf, p_1l, p_dd = _calc_window_metrics(paper_df, "Net_PnL_INR")
             p_50k = paper_df["Net_PnL_50k_1x"].sum()
+
+            p_seq = paper_df.groupby("Date").cumcount() + 1
+            p_cap2_df = paper_df[p_seq <= MAX_DAILY_TRADES_CAP]
+            pc2_n, pc2_wr, pc2_pf, pc2_tot, pc2_dd = _calc_window_metrics(p_cap2_df, "Net_PnL_Max2_50k")
+
             lines.append(
                 f"\n🔒 *Live Paper Window (Since {PAPER_TRADE_START_DATE} | {p_days}d):*\n"
-                f"• *Trades:* {len(paper_df)} | *WR:* {p_wr:.1f}% | *PF:* {p_pf:.2f}\n"
-                f"• *Net (₹1L Adap):* ₹{p_1l:+,.2f} | *Net (₹50k 1x):* ₹{p_50k:+,.2f}"
+                f"• *All Signals ({p_n}):* WR {p_wr:.1f}% | PF {p_pf:.2f} | ₹1L: ₹{p_1l:+,.2f} | ₹50k: ₹{p_50k:+,.2f}\n"
+                f"• *Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k ({pc2_n}):* WR {pc2_wr:.1f}% | PF {pc2_pf:.2f} | Net: ₹{pc2_tot:+,.2f} | DD: ₹{pc2_dd:,.2f}"
             )
 
     lines.append(
         f"\n📈 *99d Real-World Ledger Telemetry ({roster_count} Active Stocks):*\n"
-        f"• *Total Trades:* {len(combined_df)} | *Win Rate:* {win_rate:.1f}% | *PF:* {pf:.2f}\n"
-        f"• *Cumulative Net (₹1L Adap):* ₹{total_pnl:,.2f} | *Max DD:* ₹{max_dd:,.2f}\n"
-        f"• *Cumulative Net (₹50k 1x):* ₹{total_50k:,.2f}"
+        f"• *All Trades ({len(combined_df)}):* WR {win_rate:.1f}% | PF {pf:.2f} | ₹1L: ₹{total_pnl:,.2f} (DD: ₹{max_dd:,.2f})\n"
+        f"• *₹50k All:* ₹{total_50k:,.2f} | *Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k ({c2_n}):* ₹{c2_tot:,.2f} (PF {c2_pf:.2f} | DD: ₹{c2_dd:,.2f})"
     )
 
     if missing_feeds:
@@ -723,7 +741,8 @@ def run_continuous_live_loop():
     send_telegram_text(
         f"🟢 *ORVWB v6 Shadow-Live Engine Armed ({today_str})*\n"
         f"• *Active Watchlist:* {len(token_cache)} Institutional Leaders\n"
-        f"• *Cost Model:* Exact Angel One Taxes + 0.10% RT Slippage (₹50k 1x)\n"
+        f"• *Cost Model:* Exact Angel One Taxes + 0.10% RT Slippage\n"
+        f"• *Trackers:* ₹1L Adap | ₹50k All | Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k\n"
         f"• *Paper Lock:* Immutable since `{PAPER_TRADE_START_DATE}`\n"
         f"• *Mode:* Continuous 5-Minute Live Polling (`09:30` – `15:15 IST`)"
     )
@@ -771,16 +790,17 @@ def run_continuous_live_loop():
             today_df = combined_df[combined_df["Date"] == today_str]
 
             new_events = []
-            for _, r in today_df.iterrows():
+            for slot_idx, (_, r) in enumerate(today_df.iterrows(), start=1):
                 t_k = f"{r['Ticker']}_{r['Entry_Time']}"
                 cur_status = str(r["Status"])
                 if alerted_states.get(t_k) != cur_status:
                     alerted_states[t_k] = cur_status
+                    slot_tag = f"Slot #{slot_idx}/{MAX_DAILY_TRADES_CAP}" if slot_idx <= MAX_DAILY_TRADES_CAP else "Outside 2/Day Cap"
                     new_events.append(
                         f"⚡ *Live Signal Update ({hm_str} IST)*\n"
-                        f"• `{r['Ticker']}` [{r['Conviction']}] ({r['Side']} @ {r['Entry_Time']})\n"
+                        f"• `{r['Ticker']}` [{r['Conviction']} | {slot_tag}] ({r['Side']} @ {r['Entry_Time']})\n"
                         f"• *Entry:* ₹{r['Entry_Price']} | *SL:* ₹{r['Stop_Loss']} | *TP2:* ₹{r['Target_2.5R']}\n"
-                        f"• *Current Status:* `{cur_status}` ({r['Result_R']:+.2f}R | ₹{r['Net_PnL_INR']:+.2f} | 50k 1x: ₹{r['Net_PnL_50k_1x']:+.2f})"
+                        f"• *Current Status:* `{cur_status}` ({r['Result_R']:+.2f}R | ₹1L: ₹{r['Net_PnL_INR']:+.2f} | 50k: ₹{r['Net_PnL_50k_1x']:+.2f})"
                     )
             if new_events:
                 send_telegram_text("\n\n".join(new_events))
