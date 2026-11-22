@@ -25,7 +25,7 @@ LIVE_ORDER_EXECUTION = False
 # Realistic Friction & Capital Settings
 CAPITAL_PER_TRADE = 100000.0
 LIVE_START_CAPITAL_1X = 50000.0
-MAX_DAILY_TRADES_CAP = 2
+MAX_DAILY_TRADES_CAP = 1
 SLIPPAGE_PER_SIDE = 0.0005  # 0.05% per side = 0.10% round-trip slippage
 
 # Fallback 16-Stock Institutional Portfolio
@@ -171,7 +171,7 @@ def merge_ledger_with_paper_lock(
     if old_df.empty:
         return new_df.copy()
 
-    for col in ("Base_1L_PnL", "Net_PnL_50k_1x", "Net_PnL_Max2_50k"):
+    for col in ("Base_1L_PnL", "Net_PnL_50k_1x", "Net_PnL_Max1_50k"):
         if col not in old_df.columns:
             old_df[col] = np.nan
 
@@ -467,7 +467,7 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
                 "Base_1L_PnL": base_pnl,
                 "Net_PnL_INR": base_pnl,
                 "Net_PnL_50k_1x": pnl_50k,
-                "Net_PnL_Max2_50k": pnl_50k,
+                "Net_PnL_Max1_50k": pnl_50k,
                 "Status": exit_reason,
             })
     return trades
@@ -478,9 +478,10 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
         return df
     df = df.sort_values(by=["Date", "Entry_Time", "Ticker"]).reset_index(drop=True)
 
-    # Drop legacy 20k column if upgrading from an older ledger CSV
-    if "Net_PnL_20k_1x" in df.columns:
-        df.drop(columns=["Net_PnL_20k_1x"], inplace=True)
+    # Drop legacy columns if upgrading from an older ledger CSV
+    for legacy_col in ("Net_PnL_20k_1x", "Net_PnL_Max2_50k"):
+        if legacy_col in df.columns:
+            df.drop(columns=[legacy_col], inplace=True)
 
     # Recompute exact realistic friction (Angel One brokerage + taxes + 0.10% RT slippage) across all rows
     init_risk = (df["Target_2.5R"] - df["Entry_Price"]).abs() / 2.5
@@ -562,9 +563,9 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
     df["Net_PnL_INR"] = net_adap_list
     df["Net_PnL_50k_1x"] = net_50k_list
 
-    # Parallel Max 2 Trades/Day @ ₹50k tracker (first 2 chronological setups each day)
+    # Parallel Max 1 Trade/Day @ ₹50k tracker (pure 1x cash, zero leverage)
     day_seq = df.groupby("Date").cumcount() + 1
-    df["Net_PnL_Max2_50k"] = np.where(day_seq <= MAX_DAILY_TRADES_CAP, df["Net_PnL_50k_1x"], 0.0).round(2)
+    df["Net_PnL_Max1_50k"] = np.where(day_seq <= MAX_DAILY_TRADES_CAP, df["Net_PnL_50k_1x"], 0.0).round(2)
     return df
 
 
@@ -602,10 +603,10 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
 
     if not combined_df.empty:
         full_seq = combined_df.groupby("Date").cumcount() + 1
-        full_cap2_df = combined_df[full_seq <= MAX_DAILY_TRADES_CAP]
-        c2_n, c2_wr, c2_pf, c2_tot, c2_dd = _calc_window_metrics(full_cap2_df, "Net_PnL_Max2_50k")
+        full_cap_df = combined_df[full_seq <= MAX_DAILY_TRADES_CAP]
+        c_n, c_wr, c_pf, c_tot, c_dd = _calc_window_metrics(full_cap_df, "Net_PnL_Max1_50k")
     else:
-        c2_n, c2_wr, c2_pf, c2_tot, c2_dd = 0, 0.0, 0.0, 0.0, 0.0
+        c_n, c_wr, c_pf, c_tot, c_dd = 0, 0.0, 0.0, 0.0, 0.0
 
     lines = [f"📊 *ORVWB v6 Command Report ({today_str})*"]
     lines.append("_(Net of Angel One Brokerage, Taxes & 0.10% RT Slippage)_")
@@ -623,7 +624,7 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
         lines.append(
             f"• *Today's Net (₹1L Adap):* ₹{today_df['Net_PnL_INR'].sum():+,.2f}\n"
             f"• *Today's Net (₹50k All):* ₹{today_df['Net_PnL_50k_1x'].sum():+,.2f}\n"
-            f"• *Today's Net (Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k):* ₹{today_df['Net_PnL_Max2_50k'].sum():+,.2f}"
+            f"• *Today's Net (Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k 1x):* ₹{today_df['Net_PnL_Max1_50k'].sum():+,.2f}"
         )
 
     # Dedicated Locked Paper-Trading Window Telemetry
@@ -635,19 +636,19 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
             p_50k = paper_df["Net_PnL_50k_1x"].sum()
 
             p_seq = paper_df.groupby("Date").cumcount() + 1
-            p_cap2_df = paper_df[p_seq <= MAX_DAILY_TRADES_CAP]
-            pc2_n, pc2_wr, pc2_pf, pc2_tot, pc2_dd = _calc_window_metrics(p_cap2_df, "Net_PnL_Max2_50k")
+            p_cap_df = paper_df[p_seq <= MAX_DAILY_TRADES_CAP]
+            pc_n, pc_wr, pc_pf, pc_tot, pc_dd = _calc_window_metrics(p_cap_df, "Net_PnL_Max1_50k")
 
             lines.append(
                 f"\n🔒 *Live Paper Window (Since {PAPER_TRADE_START_DATE} | {p_days}d):*\n"
                 f"• *All Signals ({p_n}):* WR {p_wr:.1f}% | PF {p_pf:.2f} | ₹1L: ₹{p_1l:+,.2f} | ₹50k: ₹{p_50k:+,.2f}\n"
-                f"• *Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k ({pc2_n}):* WR {pc2_wr:.1f}% | PF {pc2_pf:.2f} | Net: ₹{pc2_tot:+,.2f} | DD: ₹{pc2_dd:,.2f}"
+                f"• *Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k 1x ({pc_n}):* WR {pc_wr:.1f}% | PF {pc_pf:.2f} | Net: ₹{pc_tot:+,.2f} | DD: ₹{pc_dd:,.2f}"
             )
 
     lines.append(
         f"\n📈 *99d Real-World Ledger Telemetry ({roster_count} Active Stocks):*\n"
         f"• *All Trades ({len(combined_df)}):* WR {win_rate:.1f}% | PF {pf:.2f} | ₹1L: ₹{total_pnl:,.2f} (DD: ₹{max_dd:,.2f})\n"
-        f"• *₹50k All:* ₹{total_50k:,.2f} | *Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k ({c2_n}):* ₹{c2_tot:,.2f} (PF {c2_pf:.2f} | DD: ₹{c2_dd:,.2f})"
+        f"• *₹50k All:* ₹{total_50k:,.2f} | *Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k 1x ({c_n}):* ₹{c_tot:,.2f} (PF {c_pf:.2f} | DD: ₹{c_dd:,.2f})"
     )
 
     if missing_feeds:
@@ -742,7 +743,7 @@ def run_continuous_live_loop():
         f"🟢 *ORVWB v6 Shadow-Live Engine Armed ({today_str})*\n"
         f"• *Active Watchlist:* {len(token_cache)} Institutional Leaders\n"
         f"• *Cost Model:* Exact Angel One Taxes + 0.10% RT Slippage\n"
-        f"• *Trackers:* ₹1L Adap | ₹50k All | Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k\n"
+        f"• *Trackers:* ₹1L Adap | ₹50k All | Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k 1x\n"
         f"• *Paper Lock:* Immutable since `{PAPER_TRADE_START_DATE}`\n"
         f"• *Mode:* Continuous 5-Minute Live Polling (`09:30` – `15:15 IST`)"
     )
@@ -795,7 +796,7 @@ def run_continuous_live_loop():
                 cur_status = str(r["Status"])
                 if alerted_states.get(t_k) != cur_status:
                     alerted_states[t_k] = cur_status
-                    slot_tag = f"Slot #{slot_idx}/{MAX_DAILY_TRADES_CAP}" if slot_idx <= MAX_DAILY_TRADES_CAP else "Outside 2/Day Cap"
+                    slot_tag = f"Slot #{slot_idx}/{MAX_DAILY_TRADES_CAP}" if slot_idx <= MAX_DAILY_TRADES_CAP else f"Outside {MAX_DAILY_TRADES_CAP}/Day Cap"
                     new_events.append(
                         f"⚡ *Live Signal Update ({hm_str} IST)*\n"
                         f"• `{r['Ticker']}` [{r['Conviction']} | {slot_tag}] ({r['Side']} @ {r['Entry_Time']})\n"
