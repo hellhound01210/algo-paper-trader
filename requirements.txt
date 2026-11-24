@@ -1,4 +1,6 @@
-yfinance
 pandas
 numpy
-pytz
+pyotp
+smartapi-python
+websocket-client
+logzero
