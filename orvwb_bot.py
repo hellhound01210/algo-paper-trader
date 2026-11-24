@@ -28,6 +28,7 @@ LIVE_START_CAPITAL_1X = 50000.0
 MAX_DAILY_TRADES_CAP = 1
 MAX_WATCHLIST_STOCKS = 10  # Tightened from 16 -> 10 to prevent lower-ranked stocks from crowding Slot #1
 SLIPPAGE_PER_SIDE = 0.0005  # 0.05% per side = 0.10% round-trip slippage
+POLL_DELAY_SECONDS = 15  # Wait 15s after each 5m candle close so Angel One finalizes OHLCV data
 
 # Fallback Institutional Portfolio (ordered strongest-first; capped to MAX_WATCHLIST_STOCKS)
 DEFAULT_WATCHLIST = [
@@ -55,14 +56,18 @@ def load_dynamic_watchlist(
         if scr.empty or "Quality_Gate" not in scr.columns:
             return fallback
 
-        passed = scr[
-            (scr["Quality_Gate"] == "PASS")
-            & (scr["Profit_Factor"] >= 1.50)
-            & (scr["Win_Rate_Pct"] >= 52.5)
-            & (scr["Recent_45d_PnL_INR"] > 0)
-            & (scr["Recent_30d_PnL_INR"] >= 0)
-            & (~scr["Ticker"].astype(str).str.startswith("IDEA."))
-        ].head(max_stocks)
+        passed = (
+            scr[
+                (scr["Quality_Gate"] == "PASS")
+                & (scr["Profit_Factor"] >= 1.50)
+                & (scr["Win_Rate_Pct"] >= 52.5)
+                & (scr["Recent_45d_PnL_INR"] > 0)
+                & (scr["Recent_30d_PnL_INR"] >= 0)
+                & (~scr["Ticker"].astype(str).str.startswith("IDEA."))
+            ]
+            .sort_values(by=["Profit_Factor", "Recent_45d_PnL_INR"], ascending=[False, False])
+            .head(max_stocks)
+        )
 
         if len(passed) < min_stocks:
             print(f"⚠️ Screener has only {len(passed)} passing stocks (< {min_stocks}). Using fallback watchlist.")
@@ -180,7 +185,7 @@ def merge_ledger_with_paper_lock(
     if old_df.empty:
         return new_df.copy()
 
-    for col in ("Base_1L_PnL", "Net_PnL_50k_1x", "Net_PnL_Max1_50k"):
+    for col in ("Base_1L_PnL", "Net_PnL_50k_1x", "Net_PnL_Max1_50k", "Conviction"):
         if col not in old_df.columns:
             old_df[col] = np.nan
 
@@ -482,17 +487,46 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
     return trades
 
 
-def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
+def apply_adaptive_conviction_sizing(df: pd.DataFrame, today_str: str = "") -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Initial chronological sort for per-ticker expanding / rolling history
-    df = df.sort_values(by=["Date", "Entry_Time", "Ticker"]).reset_index(drop=True)
+    df = df.copy().reset_index(drop=True)
 
     # Drop legacy columns if upgrading from an older ledger CSV
     for legacy_col in ("Net_PnL_20k_1x", "Net_PnL_Max2_50k"):
         if legacy_col in df.columns:
             df.drop(columns=[legacy_col], inplace=True)
+
+    # Snapshot already-closed paper-trading rows so future watchlist rotations never alter their
+    # Conviction tier, Net PnL, or Slot #1 ordering retroactively.
+    locked_cols = ["Conviction", "Base_1L_PnL", "Net_PnL_INR", "Net_PnL_50k_1x", "Net_PnL_Max1_50k"]
+    has_all_locked_cols = all(c in df.columns for c in locked_cols)
+    df["_Orig_Idx"] = np.arange(len(df))
+
+    if has_all_locked_cols:
+        dates_s = df["Date"].astype(str)
+        is_open_s = df["Status"].astype(str).str.startswith("OPEN")
+        has_vals = df[locked_cols].notna().all(axis=1)
+        is_frozen = (dates_s >= PAPER_TRADE_START_DATE) & (dates_s != today_str) & (~is_open_s) & has_vals
+    else:
+        is_frozen = pd.Series(False, index=df.index)
+
+    frozen_snapshot = {}
+    if is_frozen.any():
+        for _, r in df[is_frozen].iterrows():
+            key = (str(r["Date"]), str(r["Ticker"]), str(r["Side"]), str(r["Entry_Time"]))
+            frozen_snapshot[key] = {
+                "Conviction": r["Conviction"],
+                "Base_1L_PnL": float(r["Base_1L_PnL"]),
+                "Net_PnL_INR": float(r["Net_PnL_INR"]),
+                "Net_PnL_50k_1x": float(r["Net_PnL_50k_1x"]),
+                "Net_PnL_Max1_50k": float(r["Net_PnL_Max1_50k"]),
+                "_Orig_Idx": int(r["_Orig_Idx"]),
+            }
+
+    # Initial chronological sort for per-ticker expanding / rolling history
+    df = df.sort_values(by=["Date", "Entry_Time", "Ticker"]).reset_index(drop=True)
 
     # Recompute exact realistic friction (Angel One brokerage + taxes + 0.10% RT slippage) across all rows
     init_risk = (df["Target_2.5R"] - df["Entry_Price"]).abs() / 2.5
@@ -581,11 +615,31 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(
         by=["Date", "Entry_Time", "_Tier_Priority", "_Screener_Rank", "Ticker"]
     ).reset_index(drop=True)
-    df.drop(columns=["_Tier_Priority", "_Screener_Rank"], inplace=True)
 
     # Parallel Max 1 Trade/Day @ ₹50k tracker (pure 1x cash, zero leverage)
     day_seq = df.groupby("Date").cumcount() + 1
     df["Net_PnL_Max1_50k"] = np.where(day_seq <= MAX_DAILY_TRADES_CAP, df["Net_PnL_50k_1x"], 0.0).round(2)
+
+    # Restore exact locked values & locked intra-day slot order for closed paper-trading rows
+    if frozen_snapshot:
+        df["_Lock_Order"] = 10**9
+        for idx, r in df.iterrows():
+            key = (str(r["Date"]), str(r["Ticker"]), str(r["Side"]), str(r["Entry_Time"]))
+            if key in frozen_snapshot:
+                snap = frozen_snapshot[key]
+                df.at[idx, "Conviction"] = snap["Conviction"]
+                df.at[idx, "Base_1L_PnL"] = snap["Base_1L_PnL"]
+                df.at[idx, "Net_PnL_INR"] = snap["Net_PnL_INR"]
+                df.at[idx, "Net_PnL_50k_1x"] = snap["Net_PnL_50k_1x"]
+                df.at[idx, "Net_PnL_Max1_50k"] = snap["Net_PnL_Max1_50k"]
+                df.at[idx, "_Lock_Order"] = snap["_Orig_Idx"]
+
+        df = df.sort_values(
+            by=["Date", "_Lock_Order", "Entry_Time", "_Tier_Priority", "_Screener_Rank", "Ticker"]
+        ).reset_index(drop=True)
+        df.drop(columns=["_Lock_Order"], inplace=True)
+
+    df.drop(columns=["_Orig_Idx", "_Tier_Priority", "_Screener_Rank"], inplace=True)
     return df
 
 
@@ -700,7 +754,7 @@ def run_single_pass(smart_api, scrip_df: pd.DataFrame, today_str: str) -> tuple:
         return pd.DataFrame(), pd.DataFrame(), missing_feeds
 
     combined_df = merge_ledger_with_paper_lock(new_df, active_tickers, today_str)
-    combined_df = apply_adaptive_conviction_sizing(combined_df)
+    combined_df = apply_adaptive_conviction_sizing(combined_df, today_str=today_str)
     combined_df.to_csv(LEDGER_FILE, index=False)
     today_df = combined_df[combined_df["Date"] == today_str]
     return today_df, combined_df, missing_feeds
@@ -767,24 +821,25 @@ def run_continuous_live_loop():
         f"• *Cost Model:* Exact Angel One Taxes + 0.10% RT Slippage\n"
         f"• *Trackers:* ₹1L Adap | ₹50k All | Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k 1x\n"
         f"• *Paper Lock:* Immutable since `{PAPER_TRADE_START_DATE}`\n"
-        f"• *Mode:* Continuous 5-Minute Live Polling (`09:30` – `15:15 IST`)"
+        f"• *Mode:* Continuous 5-Minute Live Polling (`09:35:15` – `15:15:15 IST`)"
     )
 
     alerted_states = {}
     active_tickers = {f"{item['symbol']}.{item['exchange']}" for item in WATCHLIST}
+    combined_df = pd.DataFrame()
 
     while True:
         now_ist = datetime.now(IST)
         hm_str = now_ist.strftime("%H:%M")
 
-        if hm_str < "09:35":
-            target_935 = now_ist.replace(hour=9, minute=35, second=2, microsecond=0)
+        if hm_str < "09:35" or (hm_str == "09:35" and now_ist.second < POLL_DELAY_SECONDS):
+            target_935 = now_ist.replace(hour=9, minute=35, second=POLL_DELAY_SECONDS, microsecond=0)
             wait_s = max((target_935 - now_ist).total_seconds(), 1.0)
-            print(f"[{now_ist.strftime('%H:%M:%S')}] Waiting {wait_s:.0f}s for 09:35:02 IST first breakout candle close...")
+            print(f"[{now_ist.strftime('%H:%M:%S')}] Waiting {wait_s:.0f}s for 09:35:{POLL_DELAY_SECONDS:02d} IST first breakout candle close...")
             time.sleep(min(wait_s, 30.0))
             continue
 
-        if hm_str == "12:30" and now_ist.second < 15:
+        if hm_str == "12:30" and now_ist.second < 30:
             try:
                 smart_api = get_angel_session()
             except Exception as e:
@@ -808,7 +863,7 @@ def run_continuous_live_loop():
         new_df = pd.DataFrame(all_trades)
         if not new_df.empty:
             combined_df = merge_ledger_with_paper_lock(new_df, active_tickers, today_str)
-            combined_df = apply_adaptive_conviction_sizing(combined_df)
+            combined_df = apply_adaptive_conviction_sizing(combined_df, today_str=today_str)
             combined_df.to_csv(LEDGER_FILE, index=False)
             today_df = combined_df[combined_df["Date"] == today_str]
 
@@ -828,18 +883,20 @@ def run_continuous_live_loop():
             if new_events:
                 send_telegram_text("\n\n".join(new_events))
 
-        if hm_str >= "15:15":
-            print("15:15 IST EOD Square-Off reached. Sending final Command Report...")
-            today_df = combined_df[combined_df["Date"] == today_str] if not new_df.empty else pd.DataFrame()
+        now_after_poll = datetime.now(IST)
+        hm_after = now_after_poll.strftime("%H:%M")
+        if hm_after >= "15:16" or (hm_after == "15:15" and now_after_poll.second >= POLL_DELAY_SECONDS):
+            print("15:15:15+ IST EOD Square-Off poll completed. Sending final Command Report...")
+            today_df = combined_df[combined_df["Date"] == today_str] if not combined_df.empty else pd.DataFrame()
             send_telegram_summary(today_str, today_df, combined_df, missing_feeds)
             break
 
         now_ist = datetime.now(IST)
         next_min = (now_ist.minute // 5 + 1) * 5
         if next_min >= 60:
-            next_run = (now_ist + timedelta(hours=1)).replace(minute=0, second=2, microsecond=0)
+            next_run = (now_ist + timedelta(hours=1)).replace(minute=0, second=POLL_DELAY_SECONDS, microsecond=0)
         else:
-            next_run = now_ist.replace(minute=next_min, second=2, microsecond=0)
+            next_run = now_ist.replace(minute=next_min, second=POLL_DELAY_SECONDS, microsecond=0)
         sleep_secs = max((next_run - now_ist).total_seconds(), 2.0)
         print(f"[{now_ist.strftime('%H:%M:%S')}] Scan complete. Today trades: {len(today_live_trades)}. Sleeping {sleep_secs:.1f}s until {next_run.strftime('%H:%M:%S')} IST...")
         time.sleep(sleep_secs)
