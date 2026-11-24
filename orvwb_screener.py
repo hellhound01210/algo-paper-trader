@@ -9,6 +9,7 @@ import pandas as pd
 from orvwb_bot import (
     IST,
     LEDGER_FILE,
+    MAX_WATCHLIST_STOCKS,
     WATCHLIST,
     get_angel_session,
     load_token_map,
@@ -21,10 +22,10 @@ LOOKBACK_DAYS = 99
 STAGE1_TOP_N = 35
 MIN_SHARE_PRICE = 100.0
 
-# Full 150-Stock Liquid Institutional Universe (Nifty 200 / F&O Leaders Across All Sectors)
+# Full Liquid Institutional Universe (Nifty 200 / F&O Leaders Across All Sectors)
 INSTITUTIONAL_UNIVERSE = [
     # Commodities, Exchanges & Capital Markets
-    "MCX", "CDSL", "BSE", "ANGELONE", "CAMSSERV", "KFINTECH", "IEX", "MANAPPURAM", "MUTHOOTFIN",
+    "MCX", "CDSL", "BSE", "ANGELONE", "CAMS", "KFINTECH", "IEX", "MANAPPURAM", "MUTHOOTFIN",
     # Metals & Mining
     "VEDL", "JINDALSTEL", "TATASTEEL", "HINDALCO", "JSWSTEEL", "NMDC", "SAIL", "NATIONALUM", "HINDCOPPER", "APLAPOLLO",
     # Banking & PSU Grinders
@@ -39,17 +40,17 @@ INSTITUTIONAL_UNIVERSE = [
     "RELIANCE", "ONGC", "NTPC", "POWERGRID", "COALINDIA", "TATAPOWER", "ADANIPOWER", "ADANIGREEN",
     "ADANIENSOL", "JSWENERGY", "NHPC", "SJVN", "TORNTPOWER", "CESC", "BPCL", "HPCL", "IOC", "GAIL", "PETRONET", "IGL",
     # Retail, Consumer & New-Age Tech
-    "TRENT", "ZOMATO", "NYKAA", "PAYTM", "POLICYBZR", "DELHIVERY", "TITAN", "DMART", "INDHOTEL",
+    "TRENT", "ETERNAL", "NYKAA", "PAYTM", "POLICYBZR", "DELHIVERY", "TITAN", "DMART", "INDHOTEL",
     "JUBLFOOD", "DEVYANI", "VBL", "GODREJCP", "DABUR", "MARICO", "COLPAL", "ITC", "HINDUNILVR", "NESTLEIND", "TATACONSUM",
     # EMS, Cables & Industrials
     "DIXON", "KAYNES", "AMBER", "SYRMA", "POLYCAB", "KEI", "HAVELLS", "VOLTAS", "BLUESTARCO",
     "CUMMINSIND", "SIEMENS", "ABB", "CGPOWER", "THERMAX", "ASTRAL", "SUPREMEIND", "PIIND",
     # Infrastructure, Ports & Real Estate
-    "LT", "ADANIENT", "ADANIPORTS", "DLF", "GODREJPROP", "MACROTECH", "PRESTIGE", "OBEROIRLTY",
+    "LT", "ADANIENT", "ADANIPORTS", "DLF", "GODREJPROP", "LODHA", "PRESTIGE", "OBEROIRLTY",
     "PHOENIXLTD", "NCC", "IRCON", "RVNL", "IRB", "GMRAIRPORT", "CONCOR", "ULTRACEMCO", "AMBUJACEM",
     # Automobiles & EV Supply Chain
     "TATAMOTORS", "M&M", "MARUTI", "BAJAJ-AUTO", "TVSMOTOR", "EICHERMOT", "HEROMOTOCO",
-    "ASHOKLEY", "BHARATFORG", "SONACOMS", "MOTHERSON", "EXIDEIND", "AMARAJABAT", "BALKRISIND", "APOLLOTYRE",
+    "ASHOKLEY", "BHARATFORG", "SONACOMS", "MOTHERSON", "EXIDEIND", "ARE&M", "BALKRISIND", "APOLLOTYRE",
     # IT, Software & Telecom
     "BHARTIARTL", "INDUSTOWER", "TATACOMM", "PERSISTENT", "COFORGE", "TCS", "INFY",
     "HCLTECH", "WIPRO", "TECHM", "LTIM", "MPHASIS", "KPITTECH", "TATAELXSI", "OFSS", "CYIENT",
@@ -176,13 +177,12 @@ def send_screener_telegram(df_ranked: pd.DataFrame, scanned_count: int):
     if not bot_token or not chat_id or df_ranked.empty:
         return
 
-    roster_count = len(WATCHLIST)
     active_set = {f"{x['symbol']}.{x['exchange']}" for x in WATCHLIST}
-    qualified = df_ranked[df_ranked["Quality_Gate"] == "PASS"].head(roster_count)
+    qualified = df_ranked[df_ranked["Quality_Gate"] == "PASS"].head(MAX_WATCHLIST_STOCKS)
 
-    lines = [f"🛰️ *ORVWB v6 Two-Stage Institutional Screener*"]
+    lines = ["🛰️ *ORVWB v6 Two-Stage Institutional Screener*"]
     lines.append(f"• *Universe Scanned:* {scanned_count} Liquid F&O Stocks -> Top {len(df_ranked)} Deep-Audited")
-    lines.append(f"*Top {len(qualified)} Institutional Leaders (Quality Gate: PF ≥ 1.50):*")
+    lines.append(f"*Top {len(qualified)} Institutional Leaders (Cap: {MAX_WATCHLIST_STOCKS} | PF ≥ 1.50 | 30d & 45d ≥ 0):*")
     for idx, (_, r) in enumerate(qualified.iterrows(), 1):
         badge = "✅" if r["Ticker"] in active_set else "🆕"
         lines.append(
@@ -193,7 +193,7 @@ def send_screener_telegram(df_ranked: pd.DataFrame, scanned_count: int):
     if new_challengers:
         lines.append(f"\n🔄 *Verified Challengers (PF ≥ 1.50):* `{', '.join(new_challengers)}`")
     else:
-        lines.append(f"\n🔒 *Roster Status:* All {roster_count} active tickers remain optimal.")
+        lines.append(f"\n🔒 *Roster Status:* All {len(qualified)} active tickers remain optimal.")
 
     msg = "\n".join(lines)
     try:
@@ -277,7 +277,14 @@ if __name__ == "__main__":
             pnl_30d = round(tdf[tdf["Date"] >= cutoff_30d]["Net_PnL_INR"].sum(), 2)
 
             composite_score = round(0.50 * net_pnl + 0.30 * (pnl_45d * 1.6) + 0.20 * (pnl_30d * 2.2), 2)
-            quality_pass = (pf >= 1.50) and (wr >= 52.5) and (net_pnl > 2000) and (pnl_45d > 0)
+            # Aligned 1-to-1 with orvwb_bot.py load_dynamic_watchlist()
+            quality_pass = (
+                (pf >= 1.50)
+                and (wr >= 52.5)
+                and (net_pnl > 2000)
+                and (pnl_45d > 0)
+                and (pnl_30d >= 0)
+            )
 
             print(f"{ticker_name} -> 99d: ₹{net_pnl:,.0f} | 45d: ₹{pnl_45d:,.0f} | 30d: ₹{pnl_30d:,.0f} | PF: {pf} | Gate: {'PASS' if quality_pass else 'REJECT'}")
             rows.append({
@@ -297,9 +304,10 @@ if __name__ == "__main__":
     res_df = pd.DataFrame(rows)
     if not res_df.empty:
         res_df["Gate_Rank"] = (res_df["Quality_Gate"] == "PASS").astype(int)
+        # Aligned 1-to-1 with orvwb_bot.py WATCHLIST_RANK (Profit_Factor -> Recent_45d_PnL_INR)
         res_df.sort_values(
-            by=["Gate_Rank", "Composite_Score_INR", "Profit_Factor"],
-            ascending=[False, False, False],
+            by=["Gate_Rank", "Profit_Factor", "Recent_45d_PnL_INR", "Composite_Score_INR"],
+            ascending=[False, False, False, False],
             inplace=True,
         )
         dedup_df = res_df.drop_duplicates(subset=["Symbol"], keep="first").copy()
