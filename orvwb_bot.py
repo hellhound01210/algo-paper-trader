@@ -26,9 +26,10 @@ LIVE_ORDER_EXECUTION = False
 CAPITAL_PER_TRADE = 100000.0
 LIVE_START_CAPITAL_1X = 50000.0
 MAX_DAILY_TRADES_CAP = 1
+MAX_WATCHLIST_STOCKS = 10  # Tightened from 16 -> 10 to prevent lower-ranked stocks from crowding Slot #1
 SLIPPAGE_PER_SIDE = 0.0005  # 0.05% per side = 0.10% round-trip slippage
 
-# Fallback 16-Stock Institutional Portfolio
+# Fallback Institutional Portfolio (ordered strongest-first; capped to MAX_WATCHLIST_STOCKS)
 DEFAULT_WATCHLIST = [
     {"symbol": "POLICYBZR", "exchange": "NSE", "token": None},
     {"symbol": "MCX", "exchange": "NSE", "token": None},
@@ -36,26 +37,23 @@ DEFAULT_WATCHLIST = [
     {"symbol": "VEDL", "exchange": "BSE", "token": None},
     {"symbol": "LAURUSLABS", "exchange": "NSE", "token": None},
     {"symbol": "SHRIRAMFIN", "exchange": "NSE", "token": None},
-    {"symbol": "PAYTM", "exchange": "NSE", "token": None},
-    {"symbol": "RELIANCE", "exchange": "NSE", "token": None},
-    {"symbol": "BHARTIARTL", "exchange": "NSE", "token": None},
-    {"symbol": "BSE", "exchange": "NSE", "token": None},
-    {"symbol": "BAJAJFINSV", "exchange": "NSE", "token": None},
-    {"symbol": "TRENT", "exchange": "NSE", "token": None},
     {"symbol": "HDFCAMC", "exchange": "BSE", "token": None},
+    {"symbol": "BHARTIARTL", "exchange": "NSE", "token": None},
     {"symbol": "CDSL", "exchange": "NSE", "token": None},
-    {"symbol": "ICICIBANK", "exchange": "NSE", "token": None},
-    {"symbol": "PARAS", "exchange": "NSE", "token": None},
+    {"symbol": "TRENT", "exchange": "NSE", "token": None},
 ]
 
 
-def load_dynamic_watchlist(default_list: list, min_stocks: int = 8, max_stocks: int = 16) -> list:
+def load_dynamic_watchlist(
+    default_list: list, min_stocks: int = 8, max_stocks: int = MAX_WATCHLIST_STOCKS
+) -> list:
+    fallback = default_list[:max_stocks]
     if not os.path.exists(SCREENER_FILE):
-        return default_list
+        return fallback
     try:
         scr = pd.read_csv(SCREENER_FILE)
         if scr.empty or "Quality_Gate" not in scr.columns:
-            return default_list
+            return fallback
 
         passed = scr[
             (scr["Quality_Gate"] == "PASS")
@@ -68,7 +66,7 @@ def load_dynamic_watchlist(default_list: list, min_stocks: int = 8, max_stocks: 
 
         if len(passed) < min_stocks:
             print(f"⚠️ Screener has only {len(passed)} passing stocks (< {min_stocks}). Using fallback watchlist.")
-            return default_list
+            return fallback
 
         dynamic_list = []
         for ticker_str in passed["Ticker"].astype(str):
@@ -76,13 +74,18 @@ def load_dynamic_watchlist(default_list: list, min_stocks: int = 8, max_stocks: 
                 sym, exch = ticker_str.split(".", 1)
                 dynamic_list.append({"symbol": sym.strip(), "exchange": exch.strip(), "token": None})
 
-        return dynamic_list if len(dynamic_list) >= min_stocks else default_list
+        return dynamic_list if len(dynamic_list) >= min_stocks else fallback
     except Exception as e:
         print(f"⚠️ Error loading dynamic watchlist ({e}). Using fallback watchlist.")
-        return default_list
+        return fallback
 
 
 WATCHLIST = load_dynamic_watchlist(DEFAULT_WATCHLIST)
+
+# Rank map derived from screener order (0 = highest-ranked leader, used to break same-candle ties)
+WATCHLIST_RANK = {
+    f"{item['symbol']}.{item['exchange']}": idx for idx, item in enumerate(WATCHLIST)
+}
 
 PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
 
@@ -92,6 +95,12 @@ CONVICTION_LABEL_MAP = {
     1: "Tier B (0.85x)",
     2: "Tier A (1.15x)",
     3: "Tier A+ (1.35x)",
+}
+TIER_PRIORITY_MAP = {
+    "Tier A+ (1.35x)": 1,
+    "Tier A (1.15x)": 2,
+    "Tier B (0.85x)": 3,
+    "Tier C (0.70x)": 4,
 }
 
 
@@ -476,6 +485,8 @@ def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
 def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
+
+    # Initial chronological sort for per-ticker expanding / rolling history
     df = df.sort_values(by=["Date", "Entry_Time", "Ticker"]).reset_index(drop=True)
 
     # Drop legacy columns if upgrading from an older ledger CSV
@@ -562,6 +573,15 @@ def apply_adaptive_conviction_sizing(df: pd.DataFrame) -> pd.DataFrame:
 
     df["Net_PnL_INR"] = net_adap_list
     df["Net_PnL_50k_1x"] = net_50k_list
+
+    # Priority Tie-Breaker (replaces alphabetical sorting on same-candle breakouts):
+    # 1. Date -> 2. Entry_Time -> 3. Conviction Tier (A+ > A > B > C) -> 4. Screener Rank (#1 -> #10) -> 5. Ticker fallback
+    df["_Tier_Priority"] = df["Conviction"].map(TIER_PRIORITY_MAP).fillna(9)
+    df["_Screener_Rank"] = df["Ticker"].map(WATCHLIST_RANK).fillna(999)
+    df = df.sort_values(
+        by=["Date", "Entry_Time", "_Tier_Priority", "_Screener_Rank", "Ticker"]
+    ).reset_index(drop=True)
+    df.drop(columns=["_Tier_Priority", "_Screener_Rank"], inplace=True)
 
     # Parallel Max 1 Trade/Day @ ₹50k tracker (pure 1x cash, zero leverage)
     day_seq = df.groupby("Date").cumcount() + 1
@@ -707,6 +727,7 @@ def run_continuous_live_loop():
     scrip_df = load_token_map()
 
     # Step 1: Pre-Market 99-Day Historical Baseline Cache + Initial Today Cache
+    # Iterates in screener rank order (#1 strongest leader -> #10)
     token_cache = {}
     historical_trades = []
     today_trade_cache = {}  # Persistent intraday RAM cache so EOD API timeouts never drop morning trades
@@ -741,7 +762,8 @@ def run_continuous_live_loop():
 
     send_telegram_text(
         f"🟢 *ORVWB v6 Shadow-Live Engine Armed ({today_str})*\n"
-        f"• *Active Watchlist:* {len(token_cache)} Institutional Leaders\n"
+        f"• *Active Watchlist:* {len(token_cache)} Institutional Leaders (Cap: {MAX_WATCHLIST_STOCKS})\n"
+        f"• *Slot #1 Tie-Breaker:* Conviction Tier → Screener Rank\n"
         f"• *Cost Model:* Exact Angel One Taxes + 0.10% RT Slippage\n"
         f"• *Trackers:* ₹1L Adap | ₹50k All | Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k 1x\n"
         f"• *Paper Lock:* Immutable since `{PAPER_TRADE_START_DATE}`\n"
@@ -768,7 +790,7 @@ def run_continuous_live_loop():
             except Exception as e:
                 print(f"Midday session refresh warning: {e}")
 
-        # Fast 5-Day Intraday Poll across all active stocks with Persistent Intraday Cache
+        # Fast 5-Day Intraday Poll across all active stocks (in screener rank order) with Persistent Intraday Cache
         for t_key, (sym, exch, token) in token_cache.items():
             candles_5d = fetch_5m_candles(smart_api, exch, token, days_back=5)
             if candles_5d.empty:
