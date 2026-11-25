@@ -1,11 +1,6 @@
 name: ORVWB v6 Continuous Shadow-Live Trader
 
 on:
-  schedule:
-    # 08:35 IST = 03:05 UTC (Mon-Fri).
-    # Accounts for GitHub Actions' ~50-min morning queue delay so the runner boots
-    # around 09:25-09:35 IST and finishes ~5h 45m later after the 15:15:15 IST close.
-    - cron: '05 3 * * 1-5'
   workflow_dispatch:
 
 # Prevents duplicate overlapping runs: if a run is active, any duplicate is blocked.
