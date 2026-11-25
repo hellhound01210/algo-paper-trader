@@ -2,10 +2,10 @@ name: ORVWB v6 Continuous Shadow-Live Trader
 
 on:
   schedule:
-    # 09:20 IST = 03:50 UTC (Mon-Fri).
-    # Even with zero GitHub queue delay, the 6-hour (360-min) limit reaches 15:20 IST,
-    # safely covering the 15:15:15 IST EOD square-off and final Command Report.
-    - cron: '50 3 * * 1-5'
+    # 08:35 IST = 03:05 UTC (Mon-Fri).
+    # Accounts for GitHub Actions' ~50-min morning queue delay so the runner boots
+    # around 09:25-09:35 IST and finishes ~5h 45m later after the 15:15:15 IST close.
+    - cron: '05 3 * * 1-5'
   workflow_dispatch:
 
 # Prevents duplicate overlapping runs: if a run is active, any duplicate is blocked.
@@ -34,7 +34,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyotp smartapi-python websocket-client logzero
+          pip install -r requirements.txt
 
       - name: Run Continuous Intraday Shadow-Live Loop
         env:
