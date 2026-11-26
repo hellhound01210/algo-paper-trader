@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import urllib.request
 import urllib.parse
@@ -10,89 +9,27 @@ import pandas as pd
 import pyotp
 from SmartApi import SmartConnect
 
+# ==============================================================================
+# 1. CONFIGURATION (AUTO NSE F&O UNIVERSE -> TOP 9 09:30 RVOL SCANNER)
+# ==============================================================================
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
-SCREENER_FILE = "ORVWB_Screener_Ranked.csv"
 IST = timezone(timedelta(hours=5, minutes=30))
-LOOKBACK_DAYS = 99
+
+LOOKBACK_DAYS = 35          # 1 single API call per stock (~24 trading days for 20d RVOL baseline)
+MAX_SCAN_STOCKS = 180       # Scans up to 180 liquid NSE F&O stocks (~4 min runtime)
+TOP_N_RVOL = 9              # Select Top 9 stocks by 09:30 RVOL each day
+MIN_RVOL_0930 = 1.25        # Minimum 09:15-09:25 relative volume to qualify
 MIN_SHARE_PRICE = 100.0
+SLEEP_SEC = 1.1             # Rate-limit spacing (~50 req/min, safe for SmartAPI)
 
-# Immutable Paper-Trading Window Start Date (prevents survivorship & lookahead bias across screener rotations)
+# Immutable Paper-Trading Window Start Date (locks all closed paper trades since this date)
 PAPER_TRADE_START_DATE = "2026-11-10"
-
-# Master Switch: Keep False during 60-Trading-Day Shadow-Live Testing!
-LIVE_ORDER_EXECUTION = False
 
 # Realistic Friction & Capital Settings
 CAPITAL_PER_TRADE = 100000.0
 LIVE_START_CAPITAL_1X = 50000.0
 MAX_DAILY_TRADES_CAP = 1
-MAX_WATCHLIST_STOCKS = 10  # Tightened from 16 -> 10 to prevent lower-ranked stocks from crowding Slot #1
 SLIPPAGE_PER_SIDE = 0.0005  # 0.05% per side = 0.10% round-trip slippage
-POLL_DELAY_SECONDS = 15  # Wait 15s after each 5m candle close so Angel One finalizes OHLCV data
-
-# Fallback Institutional Portfolio (ordered strongest-first; capped to MAX_WATCHLIST_STOCKS)
-DEFAULT_WATCHLIST = [
-    {"symbol": "POLICYBZR", "exchange": "NSE", "token": None},
-    {"symbol": "MCX", "exchange": "NSE", "token": None},
-    {"symbol": "JINDALSTEL", "exchange": "NSE", "token": None},
-    {"symbol": "VEDL", "exchange": "BSE", "token": None},
-    {"symbol": "LAURUSLABS", "exchange": "NSE", "token": None},
-    {"symbol": "SHRIRAMFIN", "exchange": "NSE", "token": None},
-    {"symbol": "HDFCAMC", "exchange": "BSE", "token": None},
-    {"symbol": "BHARTIARTL", "exchange": "NSE", "token": None},
-    {"symbol": "CDSL", "exchange": "NSE", "token": None},
-    {"symbol": "TRENT", "exchange": "NSE", "token": None},
-]
-
-
-def load_dynamic_watchlist(
-    default_list: list, min_stocks: int = 8, max_stocks: int = MAX_WATCHLIST_STOCKS
-) -> list:
-    fallback = default_list[:max_stocks]
-    if not os.path.exists(SCREENER_FILE):
-        return fallback
-    try:
-        scr = pd.read_csv(SCREENER_FILE)
-        if scr.empty or "Quality_Gate" not in scr.columns:
-            return fallback
-
-        passed = (
-            scr[
-                (scr["Quality_Gate"] == "PASS")
-                & (scr["Profit_Factor"] >= 1.50)
-                & (scr["Win_Rate_Pct"] >= 52.5)
-                & (scr["Recent_45d_PnL_INR"] > 0)
-                & (scr["Recent_30d_PnL_INR"] >= 0)
-                & (~scr["Ticker"].astype(str).str.startswith("IDEA."))
-            ]
-            .sort_values(by=["Profit_Factor", "Recent_45d_PnL_INR"], ascending=[False, False])
-            .head(max_stocks)
-        )
-
-        if len(passed) < min_stocks:
-            print(f"⚠️ Screener has only {len(passed)} passing stocks (< {min_stocks}). Using fallback watchlist.")
-            return fallback
-
-        dynamic_list = []
-        for ticker_str in passed["Ticker"].astype(str):
-            if "." in ticker_str:
-                sym, exch = ticker_str.split(".", 1)
-                dynamic_list.append({"symbol": sym.strip(), "exchange": exch.strip(), "token": None})
-
-        return dynamic_list if len(dynamic_list) >= min_stocks else fallback
-    except Exception as e:
-        print(f"⚠️ Error loading dynamic watchlist ({e}). Using fallback watchlist.")
-        return fallback
-
-
-WATCHLIST = load_dynamic_watchlist(DEFAULT_WATCHLIST)
-
-# Rank map derived from screener order (0 = highest-ranked leader, used to break same-candle ties)
-WATCHLIST_RANK = {
-    f"{item['symbol']}.{item['exchange']}": idx for idx, item in enumerate(WATCHLIST)
-}
-
-PSU_GRINDERS = ["SBIN", "BANKBARODA", "PNB", "CANBK", "NTPC", "POWERGRID", "COALINDIA"]
 
 CONVICTION_CAP_MAP = {0: 70000.0, 1: 85000.0, 2: 115000.0, 3: 135000.0}
 CONVICTION_LABEL_MAP = {
@@ -109,16 +46,10 @@ TIER_PRIORITY_MAP = {
 }
 
 
+# ==============================================================================
+# 2. EXACT ANGEL ONE INTRADAY CHARGES & SLIPPAGE
+# ==============================================================================
 def calculate_angel_one_charges(buy_val: float, sell_val: float, exchange: str = "NSE", orders: int = 2) -> float:
-    """
-    Exact Angel One Equity Intraday Charges:
-    - Brokerage: Lower of ₹20 or 0.1% per executed order (min ₹5/order)
-    - STT: 0.025% on sell side
-    - Exchange Txn: NSE 0.00307%, BSE 0.00375% on total turnover
-    - SEBI: 0.0001% (₹10/Cr) on total turnover
-    - Stamp Duty: 0.003% on buy side
-    - GST: 18% on (Brokerage + Exchange Txn + SEBI)
-    """
     turnover = buy_val + sell_val
     if turnover <= 0:
         return 0.0
@@ -167,58 +98,17 @@ def compute_real_trade_pnl(
     return round(gross_pnl - charges - slippage, 2)
 
 
-def merge_ledger_with_paper_lock(
-    new_df: pd.DataFrame, active_tickers: set, today_str: str
-) -> pd.DataFrame:
-    """
-    Merges newly simulated trades with existing ledger while locking all closed
-    live paper trades (>= PAPER_TRADE_START_DATE):
-    - Never deletes rotated-out tickers from the paper-trading window.
-    - Never retroactively injects newly added tickers into past paper-trading dates.
-    - Allows pre-paper backtest history (< PAPER_TRADE_START_DATE), today's live trades,
-      and any prior dates with leftover OPEN rows to refresh cleanly.
-    """
-    if not os.path.exists(LEDGER_FILE):
-        return new_df.copy()
-
-    old_df = pd.read_csv(LEDGER_FILE)
-    if old_df.empty:
-        return new_df.copy()
-
-    for col in ("Base_1L_PnL", "Net_PnL_50k_1x", "Net_PnL_Max1_50k", "Conviction"):
-        if col not in old_df.columns:
-            old_df[col] = np.nan
-
-    old_dates = old_df["Date"].astype(str)
-    old_is_open = old_df["Status"].astype(str).str.startswith("OPEN")
-    open_dates = set(old_dates[old_is_open])
-
-    is_locked_paper = (old_dates >= PAPER_TRADE_START_DATE) & (old_dates != today_str) & (~old_is_open)
-    is_active_backtest = (old_dates < PAPER_TRADE_START_DATE) & (old_df["Ticker"].isin(active_tickers))
-    kept_old = old_df[is_locked_paper | is_active_backtest].copy()
-
-    has_locked_paper = (old_dates >= PAPER_TRADE_START_DATE).any()
-    if has_locked_paper and not new_df.empty:
-        new_dates = new_df["Date"].astype(str)
-        allowed_new = (
-            (new_dates < PAPER_TRADE_START_DATE)
-            | (new_dates == today_str)
-            | (new_dates.isin(open_dates))
-        )
-        filtered_new = new_df[allowed_new].copy()
-    else:
-        filtered_new = new_df.copy()
-
-    combined_df = pd.concat([kept_old, filtered_new], ignore_index=True)
-    combined_df.drop_duplicates(subset=["Date", "Ticker", "Side", "Entry_Time"], keep="last", inplace=True)
-    return combined_df
-
-
-def get_angel_session():
-    api_key = os.environ["ANGEL_API_KEY"].strip()
+# ==============================================================================
+# 3. SMARTAPI AUTH, AUTO-F&O UNIVERSE BUILDER & SINGLE-CALL 5M FETCHER
+# ==============================================================================
+def get_angel_session() -> SmartConnect:
+    api_key = (os.environ.get("ANGEL_API_KEY") or os.environ.get("ANGEL_HIST_API_KEY") or "").strip()
     client_code = os.environ["ANGEL_CLIENT_CODE"].strip()
     pin = os.environ["ANGEL_PIN"].strip()
     totp_secret = os.environ["ANGEL_TOTP_SECRET"].strip().replace(" ", "")
+
+    if not api_key:
+        raise RuntimeError("Missing ANGEL_API_KEY / ANGEL_HIST_API_KEY secret.")
 
     for attempt in range(4):
         try:
@@ -226,6 +116,7 @@ def get_angel_session():
             totp = pyotp.TOTP(totp_secret).now()
             data = smart_api.generateSession(client_code, pin, totp)
             if data and data.get("status"):
+                print(f"SmartAPI login successful for {client_code}.")
                 return smart_api
             print(f"Login attempt {attempt + 1} failed: {data}. Retrying in 5s...")
         except Exception as e:
@@ -234,81 +125,87 @@ def get_angel_session():
     raise RuntimeError("Angel One Login Failed after 4 attempts.")
 
 
-def load_token_map():
-    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-    for attempt in range(3):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=60) as response:
-                scrip_list = json.loads(response.read().decode())
-            return pd.DataFrame(scrip_list)
-        except Exception as e:
-            print(f"ScripMaster download attempt {attempt + 1} failed: {e}")
-            time.sleep(3)
+def load_token_map() -> pd.DataFrame:
+    urls = [
+        "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
+        "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
+    ]
+    for url in urls:
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    return pd.DataFrame(json.loads(response.read().decode()))
+            except Exception as e:
+                print(f"ScripMaster download attempt {attempt + 1} failed: {e}")
+                time.sleep(3)
     raise RuntimeError("Failed to download OpenAPIScripMaster.json")
 
 
-def resolve_token(scrip_df: pd.DataFrame, item: dict) -> str:
-    if item.get("token"):
-        return str(item["token"])
-    sym = item["symbol"]
-    exch = item["exchange"]
-    if exch == "NSE":
-        sub = scrip_df[(scrip_df["exch_seg"] == "NSE") & (scrip_df["symbol"] == f"{sym}-EQ")]
-    else:
-        sub = scrip_df[
-            (scrip_df["exch_seg"] == "BSE") &
-            ((scrip_df["name"] == sym) | (scrip_df["symbol"] == sym))
-        ]
-    if sub.empty:
-        return ""
-    return str(sub.iloc[0]["token"])
+def build_nse_fno_universe(scrip_df: pd.DataFrame, max_stocks: int = MAX_SCAN_STOCKS) -> list:
+    """
+    Auto-discovers active NSE F&O cash equities by matching NFO FUTSTK underlyings
+    against NSE -EQ cash tokens. Zero manual watchlist maintenance.
+    """
+    nfo_futs = scrip_df[
+        (scrip_df["exch_seg"] == "NFO") & (scrip_df["instrumenttype"] == "FUTSTK")
+    ]
+    fno_names = sorted(set(nfo_futs["name"].dropna().astype(str).str.strip()))
+
+    nse_eq = scrip_df[
+        (scrip_df["exch_seg"] == "NSE") & (scrip_df["symbol"].astype(str).str.endswith("-EQ"))
+    ]
+    eq_token_map = dict(zip(nse_eq["symbol"].astype(str), nse_eq["token"].astype(str)))
+
+    universe = []
+    for sym in fno_names:
+        if sym in ("IDEA",):  # Skip sub-₹100 penny F&O names
+            continue
+        tok = eq_token_map.get(f"{sym}-EQ")
+        if tok:
+            universe.append({"symbol": sym, "exchange": "NSE", "token": tok})
+
+    print(f"Auto-discovered {len(universe)} NSE F&O cash equities (scanning up to {max_stocks}).")
+    return universe[:max_stocks]
 
 
-def fetch_5m_candles(smart_api, exchange: str, token: str, days_back: int = LOOKBACK_DAYS) -> pd.DataFrame:
+def fetch_5m_candles_single(smart_api: SmartConnect, exchange: str, token: str, days_back: int = LOOKBACK_DAYS) -> pd.DataFrame:
     now_ist = datetime.now(IST)
-    frames = []
-    chunks = [(days_back, 50), (50, 0)] if days_back > 55 else [(days_back, 0)]
-    base_sleep = 0.35 if days_back <= 10 else 1.0
-
-    for start_d, end_d in chunks:
-        from_dt = now_ist - timedelta(days=start_d)
-        to_dt = now_ist - timedelta(days=end_d)
-        params = {
-            "exchange": exchange,
-            "symboltoken": token,
-            "interval": "FIVE_MINUTE",
-            "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
-            "todate": to_dt.strftime("%Y-%m-%d 15:30"),
-        }
-        for attempt in range(4):
-            try:
-                time.sleep(base_sleep + attempt * 1.0)
-                res = smart_api.getCandleData(params)
-                if res and res.get("status") and res.get("data"):
-                    chunk_df = pd.DataFrame(
-                        res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
-                    )
-                    frames.append(chunk_df)
-                    break
-                elif res and res.get("errorCode") in ("AB1004", "AB2001"):
-                    time.sleep(3.0 + attempt * 1.5)
-                else:
-                    time.sleep(1.2)
-            except Exception:
-                time.sleep(2.0)
-
-    if not frames:
-        return pd.DataFrame()
-
-    df = pd.concat(frames, ignore_index=True)
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
-    df.drop_duplicates(subset=["Timestamp"], keep="last", inplace=True)
-    df.sort_values("Timestamp", inplace=True)
-    df.set_index("Timestamp", inplace=True)
-    return df
+    from_dt = now_ist - timedelta(days=days_back)
+    params = {
+        "exchange": exchange,
+        "symboltoken": str(token),
+        "interval": "FIVE_MINUTE",
+        "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
+        "todate": now_ist.strftime("%Y-%m-%d 15:30"),
+    }
+    for attempt in range(4):
+        try:
+            time.sleep(SLEEP_SEC + attempt * 1.5)
+            res = smart_api.getCandleData(params)
+            if res and res.get("status") and res.get("data"):
+                df = pd.DataFrame(
+                    res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
+                )
+                df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+                for col in ("Open", "High", "Low", "Close", "Volume"):
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                df.drop_duplicates(subset=["Timestamp"], keep="last", inplace=True)
+                df.sort_values("Timestamp", inplace=True)
+                df.set_index("Timestamp", inplace=True)
+                return df
+            elif res and res.get("errorCode") in ("AB1004", "AB2001", "AB1021"):
+                time.sleep(3.5 + attempt * 2.0)
+            else:
+                time.sleep(1.2)
+        except Exception:
+            time.sleep(2.5)
+    return pd.DataFrame()
 
 
+# ==============================================================================
+# 4. 09:30 RVOL CALCULATOR & ORVWB v6 (ENGINE A ONLY) TODAY SIMULATOR
+# ==============================================================================
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     high_low = df["High"] - df["Low"]
@@ -328,321 +225,294 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def simulate_orvwb_v6(df: pd.DataFrame, symbol: str, exchange: str) -> list:
-    if df.empty:
-        return []
+def compute_today_rvol(df: pd.DataFrame, today_str: str) -> tuple:
+    """
+    Returns (today_rvol, open_price) using strictly prior 20-day average 09:15-09:25 volume.
+    """
+    or_slice = df.between_time("09:15", "09:25")
+    if or_slice.empty:
+        return np.nan, np.nan
+
+    or_vol_daily = or_slice.groupby(or_slice.index.date)["Volume"].sum()
+    or_vol_daily.index = [str(d) for d in or_vol_daily.index]
+    if today_str not in or_vol_daily.index:
+        return np.nan, np.nan
+
+    prior_vols = or_vol_daily.loc[:today_str].iloc[:-1].tail(20)
+    if len(prior_vols) < 5:
+        return np.nan, np.nan
+
+    avg20 = float(prior_vols.mean())
+    if avg20 <= 0:
+        return np.nan, np.nan
+
+    today_vol = float(or_vol_daily.loc[today_str])
+    today_or_bars = or_slice[or_slice.index.strftime("%Y-%m-%d") == today_str]
+    if len(today_or_bars) < 3:
+        return np.nan, np.nan
+
+    open_price = float(today_or_bars["Close"].iloc[-1])
+    return round(today_vol / avg20, 2), open_price
+
+
+def simulate_today_orvwb(df: pd.DataFrame, symbol: str, exchange: str, today_str: str, rvol_val: float) -> list:
     df = compute_indicators(df)
-    use_eng_a = not any(psu in symbol.upper() for psu in PSU_GRINDERS)
-    engine_name = "Engine A (35/65)" if use_eng_a else "Engine B (2.5R Run)"
-    trades = []
+    day_df = df[df.index.strftime("%Y-%m-%d") == today_str]
+    if day_df.empty:
+        return []
 
-    for trade_date, day_df in df.groupby("Date"):
-        or_bars = day_df.between_time("09:15", "09:25")
-        if len(or_bars) < 3:
+    or_bars = day_df.between_time("09:15", "09:25")
+    if len(or_bars) < 3:
+        return []
+
+    or_high = float(or_bars["High"].max())
+    or_low = float(or_bars["Low"].min())
+    or_mid = (or_high + or_low) * 0.5
+    or_width = or_high - or_low
+
+    active_bars = day_df.between_time("09:30", "15:15")
+    if len(active_bars) < 1:
+        return []
+
+    pos = 0
+    entry_price = active_stop = tp1_price = tp2_price = init_risk = 0.0
+    tp1_hit = False
+    entry_time = None
+    realized_r = 0.0
+    rem_weight = 1.0
+    exit_reason = ""
+    exit_price = 0.0
+    last_close = 0.0
+
+    for ts, row in active_bars.iterrows():
+        t_str = ts.strftime("%H:%M")
+        c, h, l, o, v = (
+            float(row["Close"]), float(row["High"]), float(row["Low"]),
+            float(row["Open"]), float(row["Volume"]),
+        )
+        atr, vwap, ema20, avg_vol = (
+            float(row["ATR"]), float(row["VWAP"]), float(row["EMA20"]), float(row["AVG_VOL"])
+        )
+        last_close = c
+
+        if np.isnan(atr) or np.isnan(avg_vol) or atr <= 0:
             continue
 
-        or_high = float(or_bars["High"].max())
-        or_low = float(or_bars["Low"].min())
-        or_mid = (or_high + or_low) * 0.5
-        or_width = or_high - or_low
-
-        entry_end = "11:10" if use_eng_a else "11:25"
-        active_bars = day_df.between_time("09:30", "15:15")
-        if len(active_bars) < 1:
-            continue
-
-        pos = 0
-        entry_price = active_stop = tp1_price = tp2_price = init_risk = 0.0
-        tp1_hit = False
-        entry_time = None
-        realized_r = 0.0
-        rem_weight = 1.0
-        exit_reason = ""
-        exit_price = 0.0
-        last_close = 0.0
-
-        for ts, row in active_bars.iterrows():
-            t_str = ts.strftime("%H:%M")
-            c, h, l, o, v = float(row["Close"]), float(row["High"]), float(row["Low"]), float(row["Open"]), float(row["Volume"])
-            atr, vwap, ema20, avg_vol = float(row["ATR"]), float(row["VWAP"]), float(row["EMA20"]), float(row["AVG_VOL"])
-            last_close = c
-
-            if np.isnan(atr) or np.isnan(avg_vol) or atr <= 0:
-                continue
-
-            if pos != 0:
-                if pos == 1:
-                    if l <= active_stop:
-                        realized_r += rem_weight * ((active_stop - entry_price) / init_risk)
-                        exit_price = active_stop
-                        exit_reason = "TP1 + BE Shield" if tp1_hit else "Stop Loss"
-                        pos = 0
-                        break
-                    if use_eng_a and not tp1_hit and h >= tp1_price:
-                        realized_r += 0.35 * 1.0
-                        rem_weight = 0.65
-                        active_stop = entry_price + (0.15 * init_risk)
-                        tp1_hit = True
-                    if h >= tp2_price:
-                        realized_r += rem_weight * 2.5
-                        exit_price = tp2_price
-                        exit_reason = "Full TP2 (+2.5R)"
-                        pos = 0
-                        break
-                elif pos == -1:
-                    if h >= active_stop:
-                        realized_r += rem_weight * ((entry_price - active_stop) / init_risk)
-                        exit_price = active_stop
-                        exit_reason = "TP1 + BE Shield" if tp1_hit else "Stop Loss"
-                        pos = 0
-                        break
-                    if use_eng_a and not tp1_hit and l <= tp1_price:
-                        realized_r += 0.35 * 1.0
-                        rem_weight = 0.65
-                        active_stop = entry_price - (0.15 * init_risk)
-                        tp1_hit = True
-                    if l <= tp2_price:
-                        realized_r += rem_weight * 2.5
-                        exit_price = tp2_price
-                        exit_reason = "Full TP2 (-2.5R)"
-                        pos = 0
-                        break
-
-                if t_str >= "15:10":
-                    move = (c - entry_price) if pos == 1 else (entry_price - c)
-                    realized_r += rem_weight * (move / init_risk)
-                    exit_price = c
-                    exit_reason = "15:15 EOD Square-Off"
+        if pos != 0:
+            if pos == 1:
+                if l <= active_stop:
+                    realized_r += rem_weight * ((active_stop - entry_price) / init_risk)
+                    exit_price = active_stop
+                    exit_reason = "TP1 + BE Shield" if tp1_hit else "Stop Loss"
+                    pos = 0
+                    break
+                if not tp1_hit and h >= tp1_price:
+                    realized_r += 0.35 * 1.0
+                    rem_weight = 0.65
+                    active_stop = entry_price + (0.15 * init_risk)
+                    tp1_hit = True
+                if h >= tp2_price:
+                    realized_r += rem_weight * 2.5
+                    exit_price = tp2_price
+                    exit_reason = "Full TP2 (+2.5R)"
+                    pos = 0
+                    break
+            elif pos == -1:
+                if h >= active_stop:
+                    realized_r += rem_weight * ((entry_price - active_stop) / init_risk)
+                    exit_price = active_stop
+                    exit_reason = "TP1 + BE Shield" if tp1_hit else "Stop Loss"
+                    pos = 0
+                    break
+                if not tp1_hit and l <= tp1_price:
+                    realized_r += 0.35 * 1.0
+                    rem_weight = 0.65
+                    active_stop = entry_price - (0.15 * init_risk)
+                    tp1_hit = True
+                if l <= tp2_price:
+                    realized_r += rem_weight * 2.5
+                    exit_price = tp2_price
+                    exit_reason = "Full TP2 (-2.5R)"
                     pos = 0
                     break
 
-            if pos == 0 and entry_time is None and t_str <= entry_end:
-                if c < MIN_SHARE_PRICE:
-                    continue
+            if t_str >= "15:10":
+                move = (c - entry_price) if pos == 1 else (entry_price - c)
+                realized_r += rem_weight * (move / init_risk)
+                exit_price = c
+                exit_reason = "15:15 EOD Square-Off"
+                pos = 0
+                break
 
-                bar_range = max(h - l, 0.05)
-                body_pct = abs(c - o) / bar_range
+        if pos == 0 and entry_time is None and t_str <= "11:10":
+            if c < MIN_SHARE_PRICE:
+                continue
 
-                if use_eng_a:
-                    or_valid = 0 < or_width <= (3.4 * atr)
-                    has_vol = v >= (1.10 * avg_vol)
-                    strong_body = body_pct >= 0.45
-                    bull_top = ((h - c) / bar_range) <= 0.35
-                    bear_bot = ((c - l) / bar_range) <= 0.35
+            bar_range = max(h - l, 0.05)
+            body_pct = abs(c - o) / bar_range
+            or_valid = 0 < or_width <= (3.4 * atr)
+            has_vol = v >= (1.10 * avg_vol)
+            strong_body = body_pct >= 0.45
+            bull_top = ((h - c) / bar_range) <= 0.35
+            bear_bot = ((c - l) / bar_range) <= 0.35
 
-                    long_sig = or_valid and has_vol and strong_body and bull_top and (c > or_high) and (c > vwap) and (c > ema20)
-                    short_sig = or_valid and has_vol and strong_body and bear_bot and (c < or_low) and (c < vwap) and (c < ema20)
-                else:
-                    has_vol = v > (1.20 * avg_vol)
-                    long_sig = has_vol and (c > or_high) and (c > vwap)
-                    short_sig = has_vol and (c < or_low) and (c < vwap)
+            long_sig = (
+                or_valid and has_vol and strong_body and bull_top
+                and (c > or_high) and (c > vwap) and (c > ema20)
+            )
+            short_sig = (
+                or_valid and has_vol and strong_body and bear_bot
+                and (c < or_low) and (c < vwap) and (c < ema20)
+            )
 
-                if long_sig:
-                    pos = 1
-                    entry_time = t_str
-                    entry_price = c
-                    raw_sl = min(or_mid - 0.75 * atr, l - 0.30 * atr)
-                    active_stop = min(raw_sl, entry_price - 0.75 * atr) if use_eng_a else (or_low - 1.0 * atr)
-                    init_risk = max(entry_price - active_stop, 0.05)
-                    tp1_price = entry_price + 1.0 * init_risk
-                    tp2_price = entry_price + 2.5 * init_risk
-                elif short_sig:
-                    pos = -1
-                    entry_time = t_str
-                    entry_price = c
-                    raw_sl = max(or_mid + 0.75 * atr, h + 0.30 * atr)
-                    active_stop = max(raw_sl, entry_price + 0.75 * atr) if use_eng_a else (or_high + 1.0 * atr)
-                    init_risk = max(active_stop - entry_price, 0.05)
-                    tp1_price = entry_price - 1.0 * init_risk
-                    tp2_price = entry_price - 2.5 * init_risk
+            if long_sig:
+                pos = 1
+                entry_time = t_str
+                entry_price = c
+                raw_sl = min(or_mid - 0.75 * atr, l - 0.30 * atr)
+                active_stop = min(raw_sl, entry_price - 0.75 * atr)
+                init_risk = max(entry_price - active_stop, 0.05)
+                tp1_price = entry_price + 1.0 * init_risk
+                tp2_price = entry_price + 2.5 * init_risk
+            elif short_sig:
+                pos = -1
+                entry_time = t_str
+                entry_price = c
+                raw_sl = max(or_mid + 0.75 * atr, h + 0.30 * atr)
+                active_stop = max(raw_sl, entry_price + 0.75 * atr)
+                init_risk = max(active_stop - entry_price, 0.05)
+                tp1_price = entry_price - 1.0 * init_risk
+                tp2_price = entry_price - 2.5 * init_risk
 
-        if entry_time is not None and pos != 0 and exit_reason == "":
-            move = (last_close - entry_price) if pos == 1 else (entry_price - last_close)
-            realized_r += rem_weight * (move / init_risk)
-            exit_price = last_close
-            exit_reason = "OPEN (TP1 Hit, Trailing)" if tp1_hit else "OPEN (Floating)"
+    if entry_time is not None and pos != 0 and exit_reason == "":
+        move = (last_close - entry_price) if pos == 1 else (entry_price - last_close)
+        realized_r += rem_weight * (move / init_risk)
+        exit_price = last_close
+        exit_reason = "OPEN (TP1 Hit, Trailing)" if tp1_hit else "OPEN (Floating)"
 
-        if entry_time is not None and exit_reason != "":
-            side_str = "LONG" if (tp2_price > entry_price) else "SHORT"
-            per_share_gross = realized_r * init_risk
-            base_pnl = compute_real_trade_pnl(entry_price, per_share_gross, side_str, exchange, exit_reason, CAPITAL_PER_TRADE)
-            pnl_50k = compute_real_trade_pnl(entry_price, per_share_gross, side_str, exchange, exit_reason, LIVE_START_CAPITAL_1X)
-            trades.append({
-                "Date": str(trade_date),
-                "Ticker": f"{symbol}.{exchange}",
-                "Engine": engine_name,
-                "Side": side_str,
-                "Entry_Time": entry_time,
-                "Entry_Price": round(entry_price, 2),
-                "Stop_Loss": round(active_stop, 2),
-                "Target_2.5R": round(tp2_price, 2),
-                "Exit_Price": round(exit_price, 2),
-                "Result_R": round(realized_r, 2),
-                "Base_1L_PnL": base_pnl,
-                "Net_PnL_INR": base_pnl,
-                "Net_PnL_50k_1x": pnl_50k,
-                "Net_PnL_Max1_50k": pnl_50k,
-                "Status": exit_reason,
-            })
-    return trades
+    if entry_time is None or exit_reason == "":
+        return []
+
+    side_str = "LONG" if (tp2_price > entry_price) else "SHORT"
+    per_share_gross = realized_r * init_risk
+    base_pnl = compute_real_trade_pnl(
+        entry_price, per_share_gross, side_str, exchange, exit_reason, CAPITAL_PER_TRADE
+    )
+    pnl_50k = compute_real_trade_pnl(
+        entry_price, per_share_gross, side_str, exchange, exit_reason, LIVE_START_CAPITAL_1X
+    )
+    return [{
+        "Date": today_str,
+        "Ticker": f"{symbol}.{exchange}",
+        "Engine": "Engine A (Top9 RVOL)",
+        "Side": side_str,
+        "Entry_Time": entry_time,
+        "RVOL_0930": rvol_val,
+        "Entry_Price": round(entry_price, 2),
+        "Stop_Loss": round(active_stop, 2),
+        "Target_2.5R": round(tp2_price, 2),
+        "Exit_Price": round(exit_price, 2),
+        "Result_R": round(realized_r, 2),
+        "Base_1L_PnL": base_pnl,
+        "Net_PnL_INR": base_pnl,
+        "Net_PnL_50k_1x": pnl_50k,
+        "Net_PnL_Max1_50k": pnl_50k,
+        "Status": exit_reason,
+    }]
 
 
-def apply_adaptive_conviction_sizing(df: pd.DataFrame, today_str: str = "") -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    df = df.copy().reset_index(drop=True)
-
-    # Drop legacy columns if upgrading from an older ledger CSV
-    for legacy_col in ("Net_PnL_20k_1x", "Net_PnL_Max2_50k"):
-        if legacy_col in df.columns:
-            df.drop(columns=[legacy_col], inplace=True)
-
-    # Snapshot already-closed paper-trading rows so future watchlist rotations never alter their
-    # Conviction tier, Net PnL, or Slot #1 ordering retroactively.
-    locked_cols = ["Conviction", "Base_1L_PnL", "Net_PnL_INR", "Net_PnL_50k_1x", "Net_PnL_Max1_50k"]
-    has_all_locked_cols = all(c in df.columns for c in locked_cols)
-    df["_Orig_Idx"] = np.arange(len(df))
-
-    if has_all_locked_cols:
-        dates_s = df["Date"].astype(str)
-        is_open_s = df["Status"].astype(str).str.startswith("OPEN")
-        has_vals = df[locked_cols].notna().all(axis=1)
-        is_frozen = (dates_s >= PAPER_TRADE_START_DATE) & (dates_s != today_str) & (~is_open_s) & has_vals
+# ==============================================================================
+# 5. LEDGER MERGE (PRESERVES ALL PAST ROWS) & CONVICTION SIZING FOR TODAY
+# ==============================================================================
+def update_ledger_with_today(today_trades: list, today_str: str) -> tuple:
+    if os.path.exists(LEDGER_FILE):
+        old_df = pd.read_csv(LEDGER_FILE)
     else:
-        is_frozen = pd.Series(False, index=df.index)
+        old_df = pd.DataFrame()
 
-    frozen_snapshot = {}
-    if is_frozen.any():
-        for _, r in df[is_frozen].iterrows():
-            key = (str(r["Date"]), str(r["Ticker"]), str(r["Side"]), str(r["Entry_Time"]))
-            frozen_snapshot[key] = {
-                "Conviction": r["Conviction"],
-                "Base_1L_PnL": float(r["Base_1L_PnL"]),
-                "Net_PnL_INR": float(r["Net_PnL_INR"]),
-                "Net_PnL_50k_1x": float(r["Net_PnL_50k_1x"]),
-                "Net_PnL_Max1_50k": float(r["Net_PnL_Max1_50k"]),
-                "_Orig_Idx": int(r["_Orig_Idx"]),
-            }
+    for col in ("Base_1L_PnL", "Net_PnL_50k_1x", "Net_PnL_Max1_50k", "Conviction", "RVOL_0930"):
+        if not old_df.empty and col not in old_df.columns:
+            old_df[col] = np.nan
 
-    # Initial chronological sort for per-ticker expanding / rolling history
-    df = df.sort_values(by=["Date", "Entry_Time", "Ticker"]).reset_index(drop=True)
+    # Keep all prior dates untouched; only replace today_str rows if re-run
+    if not old_df.empty:
+        kept_old = old_df[old_df["Date"].astype(str) != today_str].copy()
+    else:
+        kept_old = pd.DataFrame()
 
-    # Recompute exact realistic friction (Angel One brokerage + taxes + 0.10% RT slippage) across all rows
-    init_risk = (df["Target_2.5R"] - df["Entry_Price"]).abs() / 2.5
-    per_share_gross = df["Result_R"] * init_risk
+    if not today_trades:
+        if not kept_old.empty:
+            kept_old.to_csv(LEDGER_FILE, index=False)
+        return pd.DataFrame(), kept_old
 
-    base_1l_list = []
-    for idx, r in df.iterrows():
+    today_df = pd.DataFrame(today_trades)
+    today_df = today_df.sort_values(by=["Entry_Time", "Ticker"]).reset_index(drop=True)
+
+    # Compute Conviction Scores for Today using prior ledger history + today's breadth
+    scores = []
+    for idx, row in today_df.iterrows():
+        ticker = row["Ticker"]
+        is_prime = int(str(row["Entry_Time"]) <= "10:15")
+
+        if not kept_old.empty:
+            past_t = kept_old[kept_old["Ticker"] == ticker]
+            prior_3_sum = float(past_t["Base_1L_PnL"].tail(3).sum()) if not past_t.empty else 0.0
+            exp_mean_r = float(past_t["Result_R"].mean()) if len(past_t) >= 3 else 0.35
+        else:
+            prior_3_sum = 0.0
+            exp_mean_r = 0.35
+
+        sub = today_df[(today_df["Entry_Time"] <= row["Entry_Time"]) & (today_df.index != idx)]
+        same_s = int((sub["Side"] == row["Side"]).sum())
+        opp_s = int((sub["Side"] != row["Side"]).sum())
+        breadth_adj = 1 if (same_s >= 1 and opp_s == 0) else (-1 if opp_s >= 1 else 0)
+
+        sc = is_prime + int(exp_mean_r >= 0.30) + int(prior_3_sum <= 0.0) + breadth_adj
+        scores.append(int(np.clip(sc, 0, 3)))
+
+    today_df["Conviction"] = [CONVICTION_LABEL_MAP[s] for s in scores]
+
+    init_risk = (today_df["Target_2.5R"] - today_df["Entry_Price"]).abs() / 2.5
+    per_share_gross = today_df["Result_R"] * init_risk
+
+    net_adap, net_50k = [], []
+    for idx, r in today_df.iterrows():
         exch = "BSE" if ".BSE" in str(r["Ticker"]) else "NSE"
-        base_1l_list.append(
+        cap = CONVICTION_CAP_MAP[scores[idx]]
+        net_adap.append(
             compute_real_trade_pnl(
-                float(r["Entry_Price"]),
-                float(per_share_gross.loc[idx]),
-                str(r["Side"]),
-                exch,
-                str(r["Status"]),
-                CAPITAL_PER_TRADE,
+                float(r["Entry_Price"]), float(per_share_gross.loc[idx]),
+                str(r["Side"]), exch, str(r["Status"]), cap,
             )
         )
-    df["Base_1L_PnL"] = base_1l_list
-
-    prior_3_sum = (
-        df.groupby("Ticker")["Base_1L_PnL"]
-        .transform(lambda x: x.shift(1).rolling(3, min_periods=1).sum())
-        .fillna(0.0)
-    )
-    expanding_mean_r = (
-        df.groupby("Ticker")["Result_R"]
-        .transform(lambda x: x.shift(1).expanding(min_periods=3).mean())
-        .fillna(0.35)
-    )
-    is_prime_time = df["Entry_Time"] <= "10:15"
-
-    same_side_cnt = []
-    opp_side_cnt = []
-    for idx, row in df.iterrows():
-        sub = df[(df["Date"] == row["Date"]) & (df["Entry_Time"] <= row["Entry_Time"]) & (df.index != idx)]
-        same_side_cnt.append(int((sub["Side"] == row["Side"]).sum()))
-        opp_side_cnt.append(int((sub["Side"] != row["Side"]).sum()))
-
-    same_s = pd.Series(same_side_cnt, index=df.index)
-    opp_s = pd.Series(opp_side_cnt, index=df.index)
-    breadth_adj = np.where((same_s >= 1) & (opp_s == 0), 1, np.where(opp_s >= 1, -1, 0))
-
-    base_scores = (
-        is_prime_time.astype(int)
-        + (expanding_mean_r >= 0.30).astype(int)
-        + (prior_3_sum <= 0.0).astype(int)
-    )
-    scores = (base_scores + breadth_adj).clip(0, 3)
-
-    df["Conviction"] = scores.map(CONVICTION_LABEL_MAP)
-    trade_cap = scores.map(CONVICTION_CAP_MAP)
-
-    net_adap_list = []
-    net_50k_list = []
-    for idx, r in df.iterrows():
-        exch = "BSE" if ".BSE" in str(r["Ticker"]) else "NSE"
-        net_adap_list.append(
+        net_50k.append(
             compute_real_trade_pnl(
-                float(r["Entry_Price"]),
-                float(per_share_gross.loc[idx]),
-                str(r["Side"]),
-                exch,
-                str(r["Status"]),
-                float(trade_cap.loc[idx]),
-            )
-        )
-        net_50k_list.append(
-            compute_real_trade_pnl(
-                float(r["Entry_Price"]),
-                float(per_share_gross.loc[idx]),
-                str(r["Side"]),
-                exch,
-                str(r["Status"]),
-                LIVE_START_CAPITAL_1X,
+                float(r["Entry_Price"]), float(per_share_gross.loc[idx]),
+                str(r["Side"]), exch, str(r["Status"]), LIVE_START_CAPITAL_1X,
             )
         )
 
-    df["Net_PnL_INR"] = net_adap_list
-    df["Net_PnL_50k_1x"] = net_50k_list
+    today_df["Net_PnL_INR"] = net_adap
+    today_df["Net_PnL_50k_1x"] = net_50k
 
-    # Priority Tie-Breaker (replaces alphabetical sorting on same-candle breakouts):
-    # 1. Date -> 2. Entry_Time -> 3. Conviction Tier (A+ > A > B > C) -> 4. Screener Rank (#1 -> #10) -> 5. Ticker fallback
-    df["_Tier_Priority"] = df["Conviction"].map(TIER_PRIORITY_MAP).fillna(9)
-    df["_Screener_Rank"] = df["Ticker"].map(WATCHLIST_RANK).fillna(999)
-    df = df.sort_values(
-        by=["Date", "Entry_Time", "_Tier_Priority", "_Screener_Rank", "Ticker"]
-    ).reset_index(drop=True)
+    # Leading Tie-Breaker: Entry_Time -> Conviction Tier -> Highest 09:30 RVOL
+    today_df["_Tier_P"] = today_df["Conviction"].map(TIER_PRIORITY_MAP).fillna(9)
+    today_df["_RVOL_D"] = -pd.to_numeric(today_df["RVOL_0930"], errors="coerce").fillna(0.0)
+    today_df = today_df.sort_values(by=["Entry_Time", "_Tier_P", "_RVOL_D", "Ticker"]).reset_index(drop=True)
 
-    # Parallel Max 1 Trade/Day @ ₹50k tracker (pure 1x cash, zero leverage)
-    day_seq = df.groupby("Date").cumcount() + 1
-    df["Net_PnL_Max1_50k"] = np.where(day_seq <= MAX_DAILY_TRADES_CAP, df["Net_PnL_50k_1x"], 0.0).round(2)
+    today_df["Net_PnL_Max1_50k"] = np.where(
+        np.arange(len(today_df)) < MAX_DAILY_TRADES_CAP, today_df["Net_PnL_50k_1x"], 0.0
+    ).round(2)
+    today_df.drop(columns=["_Tier_P", "_RVOL_D"], inplace=True)
 
-    # Restore exact locked values & locked intra-day slot order for closed paper-trading rows
-    if frozen_snapshot:
-        df["_Lock_Order"] = 10**9
-        for idx, r in df.iterrows():
-            key = (str(r["Date"]), str(r["Ticker"]), str(r["Side"]), str(r["Entry_Time"]))
-            if key in frozen_snapshot:
-                snap = frozen_snapshot[key]
-                df.at[idx, "Conviction"] = snap["Conviction"]
-                df.at[idx, "Base_1L_PnL"] = snap["Base_1L_PnL"]
-                df.at[idx, "Net_PnL_INR"] = snap["Net_PnL_INR"]
-                df.at[idx, "Net_PnL_50k_1x"] = snap["Net_PnL_50k_1x"]
-                df.at[idx, "Net_PnL_Max1_50k"] = snap["Net_PnL_Max1_50k"]
-                df.at[idx, "_Lock_Order"] = snap["_Orig_Idx"]
-
-        df = df.sort_values(
-            by=["Date", "_Lock_Order", "Entry_Time", "_Tier_Priority", "_Screener_Rank", "Ticker"]
-        ).reset_index(drop=True)
-        df.drop(columns=["_Lock_Order"], inplace=True)
-
-    df.drop(columns=["_Orig_Idx", "_Tier_Priority", "_Screener_Rank"], inplace=True)
-    return df
+    combined_df = pd.concat([kept_old, today_df], ignore_index=True)
+    combined_df.to_csv(LEDGER_FILE, index=False)
+    return today_df, combined_df
 
 
+# ==============================================================================
+# 6. TELEGRAM REPORTING & MAIN RUNNER
+# ==============================================================================
 def _calc_window_metrics(sub_df: pd.DataFrame, pnl_col: str) -> tuple:
     if sub_df.empty:
         return 0, 0.0, 0.0, 0.0, 0.0
@@ -661,6 +531,7 @@ def send_telegram_text(msg: str):
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not bot_token or not chat_id:
+        print("Telegram credentials missing; printing message to console:\n" + msg)
         return
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -670,29 +541,35 @@ def send_telegram_text(msg: str):
         print(f"Telegram alert skipped: {e}")
 
 
-def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: pd.DataFrame, missing_feeds: list):
-    roster_count = len(WATCHLIST)
-    _, win_rate, pf, total_pnl, max_dd = _calc_window_metrics(combined_df, "Net_PnL_INR")
-    total_50k = combined_df["Net_PnL_50k_1x"].sum() if (not combined_df.empty and "Net_PnL_50k_1x" in combined_df.columns) else 0.0
+def send_telegram_summary(
+    today_str: str,
+    scanned_cnt: int,
+    qualified_cnt: int,
+    top9_list: list,
+    today_df: pd.DataFrame,
+    combined_df: pd.DataFrame,
+):
+    lines = [f"📊 *ORVWB v6 Auto-F&O → Top {TOP_N_RVOL} RVOL Report ({today_str})*"]
+    lines.append(f"_(Scanned {scanned_cnt} NSE F&O | {qualified_cnt} ≥ {MIN_RVOL_0930}x RVOL | Angel One Costs + 0.10% Slippage)_")
 
-    if not combined_df.empty:
-        full_seq = combined_df.groupby("Date").cumcount() + 1
-        full_cap_df = combined_df[full_seq <= MAX_DAILY_TRADES_CAP]
-        c_n, c_wr, c_pf, c_tot, c_dd = _calc_window_metrics(full_cap_df, "Net_PnL_Max1_50k")
+    if top9_list:
+        top_str = ", ".join(f"{x['symbol']} ({x['rvol']:.2f}x)" for x in top9_list)
+        lines.append(f"• *Today's Top {len(top9_list)} RVOL Basket:* {top_str}")
     else:
-        c_n, c_wr, c_pf, c_tot, c_dd = 0, 0.0, 0.0, 0.0, 0.0
+        lines.append("• *Today's Basket:* No stocks qualified (market holiday or no intraday bars yet).")
 
-    lines = [f"📊 *ORVWB v6 Command Report ({today_str})*"]
-    lines.append("_(Net of Angel One Brokerage, Taxes & 0.10% RT Slippage)_")
     if today_df.empty:
-        lines.append(f"• *Today's Action:* No setups triggered across the {roster_count}-stock watchlist today.")
+        lines.append(f"• *Today's Action:* No ORVWB setups triggered among today's Top {TOP_N_RVOL} RVOL stocks.")
     else:
         for slot_idx, (_, r) in enumerate(today_df.iterrows(), start=1):
             tier_str = r.get("Conviction", "Tier A")
             pnl_50k_val = r.get("Net_PnL_50k_1x", 0.0)
+            rv_val = r.get("RVOL_0930", np.nan)
+            rv_tag = f"RVOL {rv_val:.2f}x" if pd.notna(rv_val) else "RVOL N/A"
             slot_tag = f"Slot #{slot_idx}/{MAX_DAILY_TRADES_CAP}" if slot_idx <= MAX_DAILY_TRADES_CAP else "Cap Skip"
             lines.append(
-                f"• `{r['Ticker']}` [{tier_str} | {slot_tag}] ({r['Side']} @ {r['Entry_Time']} | Entry: ₹{r['Entry_Price']} | SL: ₹{r['Stop_Loss']}): "
+                f"• `{r['Ticker']}` [{tier_str} | {rv_tag} | {slot_tag}] ({r['Side']} @ {r['Entry_Time']} | "
+                f"Entry: ₹{r['Entry_Price']} | SL: ₹{r['Stop_Loss']}): "
                 f"{r['Result_R']:+.2f}R | ₹{r['Net_PnL_INR']:+.2f} (50k: ₹{pnl_50k_val:+.2f}) [{r['Status']}]"
             )
         lines.append(
@@ -701,7 +578,6 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
             f"• *Today's Net (Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k 1x):* ₹{today_df['Net_PnL_Max1_50k'].sum():+,.2f}"
         )
 
-    # Dedicated Locked Paper-Trading Window Telemetry
     if not combined_df.empty:
         paper_df = combined_df[combined_df["Date"].astype(str) >= PAPER_TRADE_START_DATE]
         if not paper_df.empty:
@@ -719,197 +595,56 @@ def send_telegram_summary(today_str: str, today_df: pd.DataFrame, combined_df: p
                 f"• *Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k 1x ({pc_n}):* WR {pc_wr:.1f}% | PF {pc_pf:.2f} | Net: ₹{pc_tot:+,.2f} | DD: ₹{pc_dd:,.2f}"
             )
 
-    lines.append(
-        f"\n📈 *99d Real-World Ledger Telemetry ({roster_count} Active Stocks):*\n"
-        f"• *All Trades ({len(combined_df)}):* WR {win_rate:.1f}% | PF {pf:.2f} | ₹1L: ₹{total_pnl:,.2f} (DD: ₹{max_dd:,.2f})\n"
-        f"• *₹50k All:* ₹{total_50k:,.2f} | *Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k 1x ({c_n}):* ₹{c_tot:,.2f} (PF {c_pf:.2f} | DD: ₹{c_dd:,.2f})"
-    )
-
-    if missing_feeds:
-        lines.append(f"⚠️ *API Watchdog:* Missing feed on {', '.join(missing_feeds)} (preserved from ledger)")
-
     send_telegram_text("\n".join(lines))
 
 
-def run_single_pass(smart_api, scrip_df: pd.DataFrame, today_str: str) -> tuple:
-    all_new_trades = []
-    missing_feeds = []
-    active_tickers = {f"{item['symbol']}.{item['exchange']}" for item in WATCHLIST}
-
-    for item in WATCHLIST:
-        sym, exch = item["symbol"], item["exchange"]
-        token = resolve_token(scrip_df, item)
-        if not token:
-            missing_feeds.append(f"{sym}.{exch}")
-            continue
-        candles = fetch_5m_candles(smart_api, exch, token, days_back=LOOKBACK_DAYS)
-        if candles.empty:
-            missing_feeds.append(f"{sym}.{exch}")
-            continue
-        sim_trades = simulate_orvwb_v6(candles, sym, exch)
-        all_new_trades.extend(sim_trades)
-
-    new_df = pd.DataFrame(all_new_trades)
-    if new_df.empty:
-        return pd.DataFrame(), pd.DataFrame(), missing_feeds
-
-    combined_df = merge_ledger_with_paper_lock(new_df, active_tickers, today_str)
-    combined_df = apply_adaptive_conviction_sizing(combined_df, today_str=today_str)
-    combined_df.to_csv(LEDGER_FILE, index=False)
-    today_df = combined_df[combined_df["Date"] == today_str]
-    return today_df, combined_df, missing_feeds
-
-
-def run_continuous_live_loop():
-    now_ist = datetime.now(IST)
-    today_str = now_ist.strftime("%Y-%m-%d")
-    roster_count = len(WATCHLIST)
-
-    # If triggered after 15:16 IST (e.g., manual EOD reconciliation), run a single pass to settle open trades
-    if now_ist.weekday() < 5 and now_ist.strftime("%H:%M") >= "15:16":
-        print(f"Post-close run detected (>= 15:16 IST) for {today_str}. Running EOD reconciliation pass...")
-        smart_api = get_angel_session()
-        scrip_df = load_token_map()
-        today_df, combined_df, mf = run_single_pass(smart_api, scrip_df, today_str)
-        if not combined_df.empty:
-            send_telegram_summary(today_str, today_df, combined_df, mf)
-        return
-
-    print(f"=== Starting Continuous Shadow-Live Engine ({roster_count} Stocks) for {today_str} ===")
+def main():
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    print(f"=== ORVWB v6 Auto-F&O -> Top {TOP_N_RVOL} RVOL Single-Pass Bot ({today_str}) ===")
 
     smart_api = get_angel_session()
     scrip_df = load_token_map()
+    universe = build_nse_fno_universe(scrip_df, max_stocks=MAX_SCAN_STOCKS)
 
-    # Step 1: Pre-Market 99-Day Historical Baseline Cache + Initial Today Cache
-    # Iterates in screener rank order (#1 strongest leader -> #10)
-    token_cache = {}
-    historical_trades = []
-    today_trade_cache = {}  # Persistent intraday RAM cache so EOD API timeouts never drop morning trades
-    missing_feeds = []
+    qualified = []
+    scanned_cnt = 0
 
-    for item in WATCHLIST:
-        sym, exch = item["symbol"], item["exchange"]
-        t_key = f"{sym}.{exch}"
-        token = resolve_token(scrip_df, item)
-        if not token:
-            missing_feeds.append(t_key)
+    for idx, item in enumerate(universe, start=1):
+        sym, exch, tok = item["symbol"], item["exchange"], item["token"]
+        candles = fetch_5m_candles_single(smart_api, exch, tok, days_back=LOOKBACK_DAYS)
+        if candles.empty:
             continue
-        token_cache[t_key] = (sym, exch, token)
-        candles_99d = fetch_5m_candles(smart_api, exch, token, days_back=LOOKBACK_DAYS)
-        if not candles_99d.empty:
-            sim_t = simulate_orvwb_v6(candles_99d, sym, exch)
-            historical_trades.extend([t for t in sim_t if t["Date"] != today_str])
-            today_init = [t for t in sim_t if t["Date"] == today_str]
-            if today_init:
-                today_trade_cache[t_key] = today_init
-            print(f"Pre-loaded 99d history for {t_key}: {len(sim_t)} setups.")
-        else:
-            missing_feeds.append(t_key)
+        scanned_cnt += 1
 
-    now_ist = datetime.now(IST)
-    if now_ist.weekday() >= 5:
-        print("Weekend run detected. Running single verification pass...")
-        today_df, combined_df, mf = run_single_pass(smart_api, scrip_df, today_str)
-        if not combined_df.empty:
-            send_telegram_summary(today_str, today_df, combined_df, mf)
-        return
+        rvol_val, open_px = compute_today_rvol(candles, today_str)
+        if not np.isnan(rvol_val) and open_px >= MIN_SHARE_PRICE and rvol_val >= MIN_RVOL_0930:
+            qualified.append({
+                "symbol": sym,
+                "exchange": exch,
+                "rvol": rvol_val,
+                "candles": candles,
+            })
 
-    send_telegram_text(
-        f"🟢 *ORVWB v6 Shadow-Live Engine Armed ({today_str})*\n"
-        f"• *Active Watchlist:* {len(token_cache)} Institutional Leaders (Cap: {MAX_WATCHLIST_STOCKS})\n"
-        f"• *Slot #1 Tie-Breaker:* Conviction Tier → Screener Rank\n"
-        f"• *Cost Model:* Exact Angel One Taxes + 0.10% RT Slippage\n"
-        f"• *Trackers:* ₹1L Adap | ₹50k All | Max {MAX_DAILY_TRADES_CAP}/d @ ₹50k 1x\n"
-        f"• *Paper Lock:* Immutable since `{PAPER_TRADE_START_DATE}`\n"
-        f"• *Mode:* Continuous 5-Minute Live Polling (`09:35:15` – `15:15:15 IST`)"
-    )
+        if idx % 25 == 0 or idx == len(universe):
+            print(f"  Progress: {idx}/{len(universe)} scanned | {len(qualified)} qualified (RVOL >= {MIN_RVOL_0930}x)")
 
-    alerted_states = {}
-    active_tickers = {f"{item['symbol']}.{item['exchange']}" for item in WATCHLIST}
-    combined_df = pd.DataFrame()
+    # Rank strictly by 09:30 RVOL and select Top 9
+    qualified.sort(key=lambda x: x["rvol"], reverse=True)
+    top9 = qualified[:TOP_N_RVOL]
 
-    while True:
-        now_ist = datetime.now(IST)
-        hm_str = now_ist.strftime("%H:%M")
+    print(f"\nTop {len(top9)} 09:30 RVOL Leaders for {today_str}:")
+    for rank, q in enumerate(top9, start=1):
+        print(f"  #{rank} {q['symbol']}.NSE — RVOL {q['rvol']:.2f}x")
 
-        if hm_str < "09:35" or (hm_str == "09:35" and now_ist.second < POLL_DELAY_SECONDS):
-            target_935 = now_ist.replace(hour=9, minute=35, second=POLL_DELAY_SECONDS, microsecond=0)
-            wait_s = max((target_935 - now_ist).total_seconds(), 1.0)
-            print(f"[{now_ist.strftime('%H:%M:%S')}] Waiting {wait_s:.0f}s for 09:35:{POLL_DELAY_SECONDS:02d} IST first breakout candle close...")
-            time.sleep(min(wait_s, 30.0))
-            continue
+    today_trades = []
+    for q in top9:
+        t_list = simulate_today_orvwb(q["candles"], q["symbol"], q["exchange"], today_str, q["rvol"])
+        today_trades.extend(t_list)
 
-        if hm_str == "12:30" and now_ist.second < 30:
-            try:
-                smart_api = get_angel_session()
-            except Exception as e:
-                print(f"Midday session refresh warning: {e}")
-
-        # Fast 5-Day Intraday Poll across all active stocks (in screener rank order) with Persistent Intraday Cache
-        for t_key, (sym, exch, token) in token_cache.items():
-            candles_5d = fetch_5m_candles(smart_api, exch, token, days_back=5)
-            if candles_5d.empty:
-                continue
-            sim_recent = simulate_orvwb_v6(candles_5d, sym, exch)
-            today_t = [t for t in sim_recent if t["Date"] == today_str]
-            if today_t:
-                today_trade_cache[t_key] = today_t
-
-        today_live_trades = []
-        for cached_list in today_trade_cache.values():
-            today_live_trades.extend(cached_list)
-
-        all_trades = historical_trades + today_live_trades
-        new_df = pd.DataFrame(all_trades)
-        if not new_df.empty:
-            combined_df = merge_ledger_with_paper_lock(new_df, active_tickers, today_str)
-            combined_df = apply_adaptive_conviction_sizing(combined_df, today_str=today_str)
-            combined_df.to_csv(LEDGER_FILE, index=False)
-            today_df = combined_df[combined_df["Date"] == today_str]
-
-            new_events = []
-            for slot_idx, (_, r) in enumerate(today_df.iterrows(), start=1):
-                t_k = f"{r['Ticker']}_{r['Entry_Time']}"
-                cur_status = str(r["Status"])
-                if alerted_states.get(t_k) != cur_status:
-                    alerted_states[t_k] = cur_status
-                    slot_tag = f"Slot #{slot_idx}/{MAX_DAILY_TRADES_CAP}" if slot_idx <= MAX_DAILY_TRADES_CAP else f"Outside {MAX_DAILY_TRADES_CAP}/Day Cap"
-                    new_events.append(
-                        f"⚡ *Live Signal Update ({hm_str} IST)*\n"
-                        f"• `{r['Ticker']}` [{r['Conviction']} | {slot_tag}] ({r['Side']} @ {r['Entry_Time']})\n"
-                        f"• *Entry:* ₹{r['Entry_Price']} | *SL:* ₹{r['Stop_Loss']} | *TP2:* ₹{r['Target_2.5R']}\n"
-                        f"• *Current Status:* `{cur_status}` ({r['Result_R']:+.2f}R | ₹1L: ₹{r['Net_PnL_INR']:+.2f} | 50k: ₹{r['Net_PnL_50k_1x']:+.2f})"
-                    )
-            if new_events:
-                send_telegram_text("\n\n".join(new_events))
-
-        now_after_poll = datetime.now(IST)
-        hm_after = now_after_poll.strftime("%H:%M")
-        if hm_after >= "15:16" or (hm_after == "15:15" and now_after_poll.second >= POLL_DELAY_SECONDS):
-            print("15:15:15+ IST EOD Square-Off poll completed. Sending final Command Report...")
-            today_df = combined_df[combined_df["Date"] == today_str] if not combined_df.empty else pd.DataFrame()
-            send_telegram_summary(today_str, today_df, combined_df, missing_feeds)
-            break
-
-        now_ist = datetime.now(IST)
-        next_min = (now_ist.minute // 5 + 1) * 5
-        if next_min >= 60:
-            next_run = (now_ist + timedelta(hours=1)).replace(minute=0, second=POLL_DELAY_SECONDS, microsecond=0)
-        else:
-            next_run = now_ist.replace(minute=next_min, second=POLL_DELAY_SECONDS, microsecond=0)
-        sleep_secs = max((next_run - now_ist).total_seconds(), 2.0)
-        print(f"[{now_ist.strftime('%H:%M:%S')}] Scan complete. Today trades: {len(today_live_trades)}. Sleeping {sleep_secs:.1f}s until {next_run.strftime('%H:%M:%S')} IST...")
-        time.sleep(sleep_secs)
+    today_df, combined_df = update_ledger_with_today(today_trades, today_str)
+    send_telegram_summary(today_str, scanned_cnt, len(qualified), top9, today_df, combined_df)
+    print(f"Done. Today's setups: {len(today_trades)} | Ledger rows: {len(combined_df)}")
 
 
 if __name__ == "__main__":
-    if "--live-loop" in sys.argv:
-        run_continuous_live_loop()
-    else:
-        today_str = datetime.now(IST).strftime("%Y-%m-%d")
-        print(f"=== Running ORVWB v6 Single-Pass Bot ({len(WATCHLIST)} Stocks) for {today_str} ===")
-        smart_api = get_angel_session()
-        scrip_df = load_token_map()
-        today_df, combined_df, missing_feeds = run_single_pass(smart_api, scrip_df, today_str)
-        if not combined_df.empty:
-            send_telegram_summary(today_str, today_df, combined_df, missing_feeds)
+    main()
