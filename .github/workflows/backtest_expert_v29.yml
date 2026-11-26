@@ -1,0 +1,67 @@
+name: Backtest Expert Confluence v2.9
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Data Source (angel = multi-year 15m, yfinance = 59-day quick test)"
+        type: choice
+        default: "angel"
+        options:
+          - angel
+          - yfinance
+      days:
+        description: "Lookback Calendar Days (e.g., 365 for Angel One, 59 for yfinance)"
+        type: string
+        default: "365"
+      tickers:
+        description: "Comma-separated NSE tickers"
+        type: string
+        default: "MCX,BSE,RELIANCE,BHARTIARTL,SBIN,BAJFINANCE,SHRIRAMFIN,POLICYBZR,JINDALSTEL,CDSL,HDFCBANK,ICICIBANK"
+      core:
+        description: "Tri-Core Routing Mode"
+        type: choice
+        default: "auto"
+        options:
+          - auto
+          - c25
+          - c24
+          - c21
+
+jobs:
+  run-backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -q pandas numpy requests yfinance smartapi-python pyotp logzero
+
+      - name: Run Expert Confluence v2.9 Backtest
+        env:
+          ANGEL_HIST_API_KEY: ${{ secrets.ANGEL_HIST_API_KEY }}
+          ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
+          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
+          ANGEL_PASSWORD: ${{ secrets.ANGEL_PASSWORD }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
+        run: |
+          python backtest_expert_v29.py \
+            --source "${{ inputs.source }}" \
+            --days "${{ inputs.days }}" \
+            --tickers "${{ inputs.tickers }}" \
+            --core "${{ inputs.core }}"
+
+      - name: Upload Backtest CSV Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: expert-v29-backtest-results
+          path: results/
