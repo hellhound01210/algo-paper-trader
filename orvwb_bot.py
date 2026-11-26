@@ -7,20 +7,21 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import pyotp
+import yfinance as yf
 from SmartApi import SmartConnect
 
 # ==============================================================================
-# 1. CONFIGURATION (AUTO NSE F&O UNIVERSE -> TOP 9 09:30 RVOL SCANNER)
+# 1. CONFIGURATION (HYBRID: YFINANCE FULL F&O RVOL SCAN -> SMARTAPI TOP 9)
 # ==============================================================================
 LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
 IST = timezone(timedelta(hours=5, minutes=30))
 
-LOOKBACK_DAYS = 35          # 1 single API call per stock (~24 trading days for 20d RVOL baseline)
-MAX_SCAN_STOCKS = 180       # Scans up to 180 liquid NSE F&O stocks (~4 min runtime)
+LOOKBACK_DAYS = 35          # ~24 trading days for 20-day 09:30 RVOL baseline (under 60d 5m cap)
 TOP_N_RVOL = 9              # Select Top 9 stocks by 09:30 RVOL each day
 MIN_RVOL_0930 = 1.25        # Minimum 09:15-09:25 relative volume to qualify
 MIN_SHARE_PRICE = 100.0
-SLEEP_SEC = 1.1             # Rate-limit spacing (~50 req/min, safe for SmartAPI)
+YF_BATCH_SIZE = 45          # Batch size for yfinance 5m scan
+SLEEP_SEC = 1.2             # Spacing for the 9 SmartAPI calls (~12s total)
 
 # Immutable Paper-Trading Window Start Date (locks all closed paper trades since this date)
 PAPER_TRADE_START_DATE = "2026-11-10"
@@ -99,32 +100,8 @@ def compute_real_trade_pnl(
 
 
 # ==============================================================================
-# 3. SMARTAPI AUTH, AUTO-F&O UNIVERSE BUILDER & SINGLE-CALL 5M FETCHER
+# 3. UNIVERSE BUILDER, YFINANCE 5M RVOL SCANNER & SMARTAPI TOP-9 FETCHER
 # ==============================================================================
-def get_angel_session() -> SmartConnect:
-    api_key = (os.environ.get("ANGEL_API_KEY") or os.environ.get("ANGEL_HIST_API_KEY") or "").strip()
-    client_code = os.environ["ANGEL_CLIENT_CODE"].strip()
-    pin = os.environ["ANGEL_PIN"].strip()
-    totp_secret = os.environ["ANGEL_TOTP_SECRET"].strip().replace(" ", "")
-
-    if not api_key:
-        raise RuntimeError("Missing ANGEL_API_KEY / ANGEL_HIST_API_KEY secret.")
-
-    for attempt in range(4):
-        try:
-            smart_api = SmartConnect(api_key=api_key)
-            totp = pyotp.TOTP(totp_secret).now()
-            data = smart_api.generateSession(client_code, pin, totp)
-            if data and data.get("status"):
-                print(f"SmartAPI login successful for {client_code}.")
-                return smart_api
-            print(f"Login attempt {attempt + 1} failed: {data}. Retrying in 5s...")
-        except Exception as e:
-            print(f"Login exception on attempt {attempt + 1}: {e}")
-        time.sleep(5)
-    raise RuntimeError("Angel One Login Failed after 4 attempts.")
-
-
 def load_token_map() -> pd.DataFrame:
     urls = [
         "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
@@ -142,11 +119,7 @@ def load_token_map() -> pd.DataFrame:
     raise RuntimeError("Failed to download OpenAPIScripMaster.json")
 
 
-def build_nse_fno_universe(scrip_df: pd.DataFrame, max_stocks: int = MAX_SCAN_STOCKS) -> list:
-    """
-    Auto-discovers active NSE F&O cash equities by matching NFO FUTSTK underlyings
-    against NSE -EQ cash tokens. Zero manual watchlist maintenance.
-    """
+def build_nse_fno_universe(scrip_df: pd.DataFrame) -> list:
     nfo_futs = scrip_df[
         (scrip_df["exch_seg"] == "NFO") & (scrip_df["instrumenttype"] == "FUTSTK")
     ]
@@ -159,70 +132,14 @@ def build_nse_fno_universe(scrip_df: pd.DataFrame, max_stocks: int = MAX_SCAN_ST
 
     universe = []
     for sym in fno_names:
-        if sym in ("IDEA",):  # Skip sub-₹100 penny F&O names
+        if sym in ("IDEA",):
             continue
         tok = eq_token_map.get(f"{sym}-EQ")
         if tok:
             universe.append({"symbol": sym, "exchange": "NSE", "token": tok})
 
-    print(f"Auto-discovered {len(universe)} NSE F&O cash equities (scanning up to {max_stocks}).")
-    return universe[:max_stocks]
-
-
-def fetch_5m_candles_single(smart_api: SmartConnect, exchange: str, token: str, days_back: int = LOOKBACK_DAYS) -> pd.DataFrame:
-    now_ist = datetime.now(IST)
-    from_dt = now_ist - timedelta(days=days_back)
-    params = {
-        "exchange": exchange,
-        "symboltoken": str(token),
-        "interval": "FIVE_MINUTE",
-        "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
-        "todate": now_ist.strftime("%Y-%m-%d 15:30"),
-    }
-    for attempt in range(4):
-        try:
-            time.sleep(SLEEP_SEC + attempt * 1.5)
-            res = smart_api.getCandleData(params)
-            if res and res.get("status") and res.get("data"):
-                df = pd.DataFrame(
-                    res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
-                )
-                df["Timestamp"] = pd.to_datetime(df["Timestamp"])
-                for col in ("Open", "High", "Low", "Close", "Volume"):
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-                df.drop_duplicates(subset=["Timestamp"], keep="last", inplace=True)
-                df.sort_values("Timestamp", inplace=True)
-                df.set_index("Timestamp", inplace=True)
-                return df
-            elif res and res.get("errorCode") in ("AB1004", "AB2001", "AB1021"):
-                time.sleep(3.5 + attempt * 2.0)
-            else:
-                time.sleep(1.2)
-        except Exception:
-            time.sleep(2.5)
-    return pd.DataFrame()
-
-
-# ==============================================================================
-# 4. 09:30 RVOL CALCULATOR & ORVWB v6 (ENGINE A ONLY) TODAY SIMULATOR
-# ==============================================================================
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    high_low = df["High"] - df["Low"]
-    high_close = (df["High"] - df["Close"].shift(1)).abs()
-    low_close = (df["Low"] - df["Close"].shift(1)).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df["ATR"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
-    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
-    df["AVG_VOL"] = df["Volume"].rolling(20).mean()
-
-    df["Date"] = df.index.date
-    hlc3 = (df["High"] + df["Low"] + df["Close"]) / 3.0
-    df["PV"] = hlc3 * df["Volume"]
-    df["Cum_PV"] = df.groupby("Date")["PV"].cumsum()
-    df["Cum_Vol"] = df.groupby("Date")["Volume"].cumsum()
-    df["VWAP"] = np.where(df["Cum_Vol"] > 0, df["Cum_PV"] / df["Cum_Vol"], hlc3)
-    return df
+    print(f"Auto-discovered {len(universe)} active NSE F&O cash equities (Full A-Z).")
+    return universe
 
 
 def compute_today_rvol(df: pd.DataFrame, today_str: str) -> tuple:
@@ -253,6 +170,153 @@ def compute_today_rvol(df: pd.DataFrame, today_str: str) -> tuple:
 
     open_price = float(today_or_bars["Close"].iloc[-1])
     return round(today_vol / avg20, 2), open_price
+
+
+def scan_rvol_yfinance(universe: list, today_str: str) -> tuple:
+    """
+    Fast batch 5m RVOL scan across the full A-Z NSE F&O universe via yfinance (~25s).
+    """
+    start_dt = (datetime.now(IST) - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    qualified = []
+    scanned_cnt = 0
+
+    for i in range(0, len(universe), YF_BATCH_SIZE):
+        batch = universe[i : i + YF_BATCH_SIZE]
+        yf_tickers = [f"{item['symbol']}.NS" for item in batch]
+
+        try:
+            raw = yf.download(
+                yf_tickers,
+                start=start_dt,
+                interval="5m",
+                group_by="ticker",
+                auto_adjust=False,
+                threads=True,
+                progress=False,
+            )
+        except Exception as e:
+            print(f"[Warn] yfinance batch {i}-{i + len(batch)} failed: {e}")
+            continue
+
+        if raw is None or raw.empty:
+            continue
+
+        for item, y_t in zip(batch, yf_tickers):
+            try:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    if y_t not in raw.columns.get_level_values(0):
+                        continue
+                    sub = raw[y_t].copy()
+                else:
+                    sub = raw.copy()
+
+                sub = sub[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                if sub.empty:
+                    continue
+
+                if sub.index.tz is None:
+                    sub.index = sub.index.tz_localize("UTC").tz_convert("Asia/Kolkata")
+                else:
+                    sub.index = sub.index.tz_convert("Asia/Kolkata")
+
+                scanned_cnt += 1
+                rvol_val, open_px = compute_today_rvol(sub, today_str)
+                if not np.isnan(rvol_val) and open_px >= MIN_SHARE_PRICE and rvol_val >= MIN_RVOL_0930:
+                    qualified.append({
+                        "symbol": item["symbol"],
+                        "exchange": item["exchange"],
+                        "token": item["token"],
+                        "rvol": rvol_val,
+                    })
+            except Exception:
+                continue
+
+        print(f"  Batch {min(i + YF_BATCH_SIZE, len(universe))}/{len(universe)} scanned | {len(qualified)} qualified")
+        time.sleep(0.4)
+
+    qualified.sort(key=lambda x: x["rvol"], reverse=True)
+    return qualified, scanned_cnt
+
+
+def get_angel_session() -> SmartConnect:
+    api_key = (os.environ.get("ANGEL_API_KEY") or os.environ.get("ANGEL_HIST_API_KEY") or "").strip()
+    client_code = os.environ["ANGEL_CLIENT_CODE"].strip()
+    pin = os.environ["ANGEL_PIN"].strip()
+    totp_secret = os.environ["ANGEL_TOTP_SECRET"].strip().replace(" ", "")
+
+    if not api_key:
+        raise RuntimeError("Missing ANGEL_API_KEY / ANGEL_HIST_API_KEY secret.")
+
+    for attempt in range(4):
+        try:
+            smart_api = SmartConnect(api_key=api_key)
+            totp = pyotp.TOTP(totp_secret).now()
+            data = smart_api.generateSession(client_code, pin, totp)
+            if data and data.get("status"):
+                print(f"SmartAPI login successful for {client_code}.")
+                return smart_api
+            print(f"Login attempt {attempt + 1} failed: {data}. Retrying in 5s...")
+        except Exception as e:
+            print(f"Login exception on attempt {attempt + 1}: {e}")
+        time.sleep(5)
+    raise RuntimeError("Angel One Login Failed after 4 attempts.")
+
+
+def fetch_5m_candles_single(smart_api: SmartConnect, exchange: str, token: str, days_back: int = LOOKBACK_DAYS) -> pd.DataFrame:
+    now_ist = datetime.now(IST)
+    from_dt = now_ist - timedelta(days=days_back)
+    params = {
+        "exchange": exchange,
+        "symboltoken": str(token),
+        "interval": "FIVE_MINUTE",
+        "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
+        "todate": now_ist.strftime("%Y-%m-%d 15:30"),
+    }
+    for attempt in range(4):
+        try:
+            time.sleep(SLEEP_SEC + attempt * 2.0)
+            res = smart_api.getCandleData(params)
+            if res and res.get("status") and res.get("data"):
+                df = pd.DataFrame(
+                    res["data"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
+                )
+                df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+                for col in ("Open", "High", "Low", "Close", "Volume"):
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                df = df.drop_duplicates(subset=["Timestamp"], keep="last")
+                df = df.sort_values("Timestamp")
+                df = df.set_index("Timestamp")
+                return df
+            elif res and res.get("errorCode") in ("AB1004", "AB2001", "AB1021"):
+                time.sleep(4.0 + attempt * 2.0)
+            else:
+                time.sleep(1.5)
+        except Exception as e:
+            print(f"[Warn] SmartAPI fetch try {attempt + 1} for token {token}: {e}")
+            time.sleep(4.0)
+    return pd.DataFrame()
+
+
+# ==============================================================================
+# 4. ORVWB v6 (ENGINE A ONLY) TODAY SIMULATOR
+# ==============================================================================
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    high_low = df["High"] - df["Low"]
+    high_close = (df["High"] - df["Close"].shift(1)).abs()
+    low_close = (df["Low"] - df["Close"].shift(1)).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df["ATR"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
+    df["AVG_VOL"] = df["Volume"].rolling(20).mean()
+
+    df["Date"] = df.index.date
+    hlc3 = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    df["PV"] = hlc3 * df["Volume"]
+    df["Cum_PV"] = df.groupby("Date")["PV"].cumsum()
+    df["Cum_Vol"] = df.groupby("Date")["Volume"].cumsum()
+    df["VWAP"] = np.where(df["Cum_Vol"] > 0, df["Cum_PV"] / df["Cum_Vol"], hlc3)
+    return df
 
 
 def simulate_today_orvwb(df: pd.DataFrame, symbol: str, exchange: str, today_str: str, rvol_val: float) -> list:
@@ -434,7 +498,6 @@ def update_ledger_with_today(today_trades: list, today_str: str) -> tuple:
         if not old_df.empty and col not in old_df.columns:
             old_df[col] = np.nan
 
-    # Keep all prior dates untouched; only replace today_str rows if re-run
     if not old_df.empty:
         kept_old = old_df[old_df["Date"].astype(str) != today_str].copy()
     else:
@@ -448,7 +511,6 @@ def update_ledger_with_today(today_trades: list, today_str: str) -> tuple:
     today_df = pd.DataFrame(today_trades)
     today_df = today_df.sort_values(by=["Entry_Time", "Ticker"]).reset_index(drop=True)
 
-    # Compute Conviction Scores for Today using prior ledger history + today's breadth
     scores = []
     for idx, row in today_df.iterrows():
         ticker = row["Ticker"]
@@ -495,7 +557,6 @@ def update_ledger_with_today(today_trades: list, today_str: str) -> tuple:
     today_df["Net_PnL_INR"] = net_adap
     today_df["Net_PnL_50k_1x"] = net_50k
 
-    # Leading Tie-Breaker: Entry_Time -> Conviction Tier -> Highest 09:30 RVOL
     today_df["_Tier_P"] = today_df["Conviction"].map(TIER_PRIORITY_MAP).fillna(9)
     today_df["_RVOL_D"] = -pd.to_numeric(today_df["RVOL_0930"], errors="coerce").fillna(0.0)
     today_df = today_df.sort_values(by=["Entry_Time", "_Tier_P", "_RVOL_D", "Ticker"]).reset_index(drop=True)
@@ -503,7 +564,7 @@ def update_ledger_with_today(today_trades: list, today_str: str) -> tuple:
     today_df["Net_PnL_Max1_50k"] = np.where(
         np.arange(len(today_df)) < MAX_DAILY_TRADES_CAP, today_df["Net_PnL_50k_1x"], 0.0
     ).round(2)
-    today_df.drop(columns=["_Tier_P", "_RVOL_D"], inplace=True)
+    today_df = today_df.drop(columns=["_Tier_P", "_RVOL_D"])
 
     combined_df = pd.concat([kept_old, today_df], ignore_index=True)
     combined_df.to_csv(LEDGER_FILE, index=False)
@@ -549,8 +610,8 @@ def send_telegram_summary(
     today_df: pd.DataFrame,
     combined_df: pd.DataFrame,
 ):
-    lines = [f"📊 *ORVWB v6 Auto-F&O → Top {TOP_N_RVOL} RVOL Report ({today_str})*"]
-    lines.append(f"_(Scanned {scanned_cnt} NSE F&O | {qualified_cnt} ≥ {MIN_RVOL_0930}x RVOL | Angel One Costs + 0.10% Slippage)_")
+    lines = [f"📊 *ORVWB v6 Hybrid Auto-F&O → Top {TOP_N_RVOL} RVOL ({today_str})*"]
+    lines.append(f"_(Scanned {scanned_cnt} NSE F&O | {qualified_cnt} ≥ {MIN_RVOL_0930}x RVOL | SmartAPI Top-{TOP_N_RVOL} Fills)_")
 
     if top9_list:
         top_str = ", ".join(f"{x['symbol']} ({x['rvol']:.2f}x)" for x in top9_list)
@@ -600,46 +661,30 @@ def send_telegram_summary(
 
 def main():
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    print(f"=== ORVWB v6 Auto-F&O -> Top {TOP_N_RVOL} RVOL Single-Pass Bot ({today_str}) ===")
+    print(f"=== ORVWB v6 Hybrid Auto-F&O -> Top {TOP_N_RVOL} RVOL Bot ({today_str}) ===")
 
-    smart_api = get_angel_session()
     scrip_df = load_token_map()
-    universe = build_nse_fno_universe(scrip_df, max_stocks=MAX_SCAN_STOCKS)
+    universe = build_nse_fno_universe(scrip_df)
 
-    qualified = []
-    scanned_cnt = 0
-
-    for idx, item in enumerate(universe, start=1):
-        sym, exch, tok = item["symbol"], item["exchange"], item["token"]
-        candles = fetch_5m_candles_single(smart_api, exch, tok, days_back=LOOKBACK_DAYS)
-        if candles.empty:
-            continue
-        scanned_cnt += 1
-
-        rvol_val, open_px = compute_today_rvol(candles, today_str)
-        if not np.isnan(rvol_val) and open_px >= MIN_SHARE_PRICE and rvol_val >= MIN_RVOL_0930:
-            qualified.append({
-                "symbol": sym,
-                "exchange": exch,
-                "rvol": rvol_val,
-                "candles": candles,
-            })
-
-        if idx % 25 == 0 or idx == len(universe):
-            print(f"  Progress: {idx}/{len(universe)} scanned | {len(qualified)} qualified (RVOL >= {MIN_RVOL_0930}x)")
-
-    # Rank strictly by 09:30 RVOL and select Top 9
-    qualified.sort(key=lambda x: x["rvol"], reverse=True)
+    # Stage 1: Full A-Z RVOL scan via yfinance (~25s, zero SmartAPI rate limits)
+    qualified, scanned_cnt = scan_rvol_yfinance(universe, today_str)
     top9 = qualified[:TOP_N_RVOL]
 
     print(f"\nTop {len(top9)} 09:30 RVOL Leaders for {today_str}:")
     for rank, q in enumerate(top9, start=1):
         print(f"  #{rank} {q['symbol']}.NSE — RVOL {q['rvol']:.2f}x")
 
+    # Stage 2: Exact broker 5m simulation on Top 9 only via SmartAPI (~12s)
     today_trades = []
-    for q in top9:
-        t_list = simulate_today_orvwb(q["candles"], q["symbol"], q["exchange"], today_str, q["rvol"])
-        today_trades.extend(t_list)
+    if top9:
+        smart_api = get_angel_session()
+        for q in top9:
+            candles = fetch_5m_candles_single(smart_api, q["exchange"], q["token"], days_back=LOOKBACK_DAYS)
+            if candles.empty:
+                print(f"  [Warn] No SmartAPI candles returned for {q['symbol']}.NSE; skipping.")
+                continue
+            t_list = simulate_today_orvwb(candles, q["symbol"], q["exchange"], today_str, q["rvol"])
+            today_trades.extend(t_list)
 
     today_df, combined_df = update_ledger_with_today(today_trades, today_str)
     send_telegram_summary(today_str, scanned_cnt, len(qualified), top9, today_df, combined_df)
