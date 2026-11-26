@@ -1,0 +1,56 @@
+{
+  "initial_capital": 500000.0,
+  "trading_day_count": 1,
+  "last_processed_date": "2026-11-26",
+  "tranches": {
+    "T1": {
+      "cash": 10094.157078908538,
+      "positions": {
+        "DIVISLAB.NS": {
+          "shares": 2,
+          "entry_price": 11741.5,
+          "entry_date": "2026-11-26",
+          "stop": 9980.275
+        },
+        "KOTAKBANK.NS": {
+          "shares": 120,
+          "entry_price": 507.5,
+          "entry_date": "2026-11-26",
+          "stop": 431.375
+        },
+        "COFORGE.NS": {
+          "shares": 24,
+          "entry_price": 2086.0,
+          "entry_date": "2026-11-26",
+          "stop": 1773.1
+        },
+        "DLF.NS": {
+          "shares": 74,
+          "entry_price": 795.9000244140625,
+          "entry_date": "2026-11-26",
+          "stop": 676.5150207519531
+        },
+        "TVSMOTOR.NS": {
+          "shares": 10,
+          "entry_price": 4609.5,
+          "entry_date": "2026-11-26",
+          "stop": 3918.075
+        }
+      },
+      "prev_equity": 247828.35861699446,
+      "daily_rets": [
+        -0.008686565532022184
+      ],
+      "total_costs": 526.7649239746095
+    },
+    "T2": {
+      "cash": 250059.5238095238,
+      "positions": {},
+      "prev_equity": 250059.5238095238,
+      "daily_rets": [
+        0.00023809523809514843
+      ],
+      "total_costs": 0.0
+    }
+  }
+}
