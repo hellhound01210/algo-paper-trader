@@ -43,11 +43,12 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -q pandas numpy requests yfinance smartapi-python pyotp logzero
+          pip install -q pandas numpy requests yfinance smartapi-python websocket-client pyotp logzero
 
       - name: Run Expert Confluence v2.9 Backtest
         env:
           ANGEL_HIST_API_KEY: ${{ secrets.ANGEL_HIST_API_KEY }}
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
           ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
           ANGEL_PASSWORD: ${{ secrets.ANGEL_PASSWORD }}
