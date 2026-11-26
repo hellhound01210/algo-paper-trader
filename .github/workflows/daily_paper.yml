@@ -1,8 +1,6 @@
 name: ORVWB v6 Daily EOD Paper Trader
 
 on:
-  schedule:
-    - cron: "46 9 * * 1-5" # 15:16 IST (Mon-Fri)
   workflow_dispatch:
 
 permissions:
