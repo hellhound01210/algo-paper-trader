@@ -1,0 +1,47 @@
+name: Monthly Momentum (Mom_2Slot_12SL) Paper Trader
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_rebalance:
+        description: "Force a rebalance right now (leave false for normal daily check & auto month-start rebalance)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  run-mom-paper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install yfinance pandas numpy
+
+      - name: Run Monthly Momentum Paper Bot
+        env:
+          FORCE_REBALANCE: ${{ github.event.inputs.force_rebalance || 'false' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monthly_mom_bot.py
+
+      - name: Commit Updated State & Ledgers
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Mom_2Slot_12SL_State.json Mom_2Slot_12SL_Ledger.csv Mom_2Slot_12SL_Equity.csv
+          git diff --staged --quiet || git commit -m "Mom_2Slot_12SL paper update"
+          git push
