@@ -23,11 +23,12 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install smartapi-python pyotp pandas numpy requests logzero websocket-client pycryptodome
+          pip install yfinance smartapi-python pyotp pandas numpy requests logzero websocket-client pycryptodome
 
       - name: Run ORVWB v6 EOD Single-Pass Bot
         env:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_HIST_API_KEY: ${{ secrets.ANGEL_HIST_API_KEY }}
           ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
           ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
           ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
