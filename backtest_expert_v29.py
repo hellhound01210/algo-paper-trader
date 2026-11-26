@@ -28,7 +28,8 @@ OOS_EXTENDED = [
 ]
 
 IST_TZ = "Asia/Kolkata"
-SCRIP_MASTER_URL = "https://margincalculator.angelone.in/OpenAPIScripMaster.json"
+SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+
 
 
 # ==========================================
