@@ -11,15 +11,18 @@ import yfinance as yf
 from SmartApi import SmartConnect
 
 # ==============================================================================
-# 1. CONFIGURATION (HYBRID: YFINANCE FULL F&O RVOL SCAN -> SMARTAPI TOP 9)
+# 1. CONFIGURATION (ORVWB v7: HYBRID TOP-9 RVOL + PRIME 10:15 + NIFTY 5M REGIME)
 # ==============================================================================
-LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"
+LEDGER_FILE = "ORVWB_v6_Elite_Ledger.csv"   # Keeps existing ledger & daily_paper.yml intact
 IST = timezone(timedelta(hours=5, minutes=30))
 
 LOOKBACK_DAYS = 35          # ~24 trading days for 20-day 09:30 RVOL baseline (under 60d 5m cap)
+NIFTY_LOOKBACK_DAYS = 10    # Warmup window for Nifty 50 5m EMA20
 TOP_N_RVOL = 9              # Select Top 9 stocks by 09:30 RVOL each day
 MIN_RVOL_0930 = 1.25        # Minimum 09:15-09:25 relative volume to qualify
 MIN_SHARE_PRICE = 100.0
+ENTRY_CUTOFF_TIME = "10:15" # v7 Upgrade: Prime opening window only (eliminates 10:20-11:10 bleed)
+USE_NIFTY_REGIME = True     # v7 Upgrade: LONG only if Nifty > EMA20 & Day Open; SHORT only if < both
 YF_BATCH_SIZE = 45          # Batch size for yfinance 5m scan
 SLEEP_SEC = 1.2             # Spacing for the 9 SmartAPI calls (~12s total)
 
@@ -48,17 +51,25 @@ TIER_PRIORITY_MAP = {
 
 
 # ==============================================================================
-# 2. EXACT ANGEL ONE INTRADAY CHARGES & SLIPPAGE
+# 2. EXACT ANGEL ONE INTRADAY CHARGES & SLIPPAGE (v7: FIXED 3-ORDER ACCOUNTING)
 # ==============================================================================
-def calculate_angel_one_charges(buy_val: float, sell_val: float, exchange: str = "NSE", orders: int = 2) -> float:
+def calculate_angel_one_charges(
+    buy_val: float,
+    sell_val: float,
+    exchange: str = "NSE",
+    orders: int = 2,
+    side: str = "LONG",
+) -> float:
     turnover = buy_val + sell_val
     if turnover <= 0:
         return 0.0
 
     if orders == 3:
-        b1 = max(5.0, min(20.0, buy_val * 0.001))
-        b2 = max(5.0, min(20.0, (sell_val * 0.35) * 0.001))
-        b3 = max(5.0, min(20.0, (sell_val * 0.65) * 0.001))
+        entry_val = buy_val if side == "LONG" else sell_val
+        exit_val = sell_val if side == "LONG" else buy_val
+        b1 = max(5.0, min(20.0, entry_val * 0.001))
+        b2 = max(5.0, min(20.0, (exit_val * 0.35) * 0.001))
+        b3 = max(5.0, min(20.0, (exit_val * 0.65) * 0.001))
         brokerage = b1 + b2 + b3
     else:
         b1 = max(5.0, min(20.0, buy_val * 0.001))
@@ -82,6 +93,7 @@ def compute_real_trade_pnl(
     exchange: str,
     status: str,
     capital: float,
+    tp1_hit: bool = False,
 ) -> float:
     qty = int(capital // entry_price)
     if qty < 1:
@@ -93,14 +105,15 @@ def compute_real_trade_pnl(
     buy_val = entry_val if side == "LONG" else exit_val
     sell_val = exit_val if side == "LONG" else entry_val
 
-    orders = 3 if ("TP1" in str(status) or "TP2" in str(status)) else 2
-    charges = calculate_angel_one_charges(buy_val, sell_val, exchange, orders)
+    is_three_orders = bool(tp1_hit) or ("TP1" in str(status)) or ("TP2" in str(status))
+    orders = 3 if is_three_orders else 2
+    charges = calculate_angel_one_charges(buy_val, sell_val, exchange, orders=orders, side=side)
     slippage = (buy_val + sell_val) * SLIPPAGE_PER_SIDE
     return round(gross_pnl - charges - slippage, 2)
 
 
 # ==============================================================================
-# 3. UNIVERSE BUILDER, YFINANCE 5M RVOL SCANNER & SMARTAPI TOP-9 FETCHER
+# 3. UNIVERSE BUILDER, NIFTY 5M REGIME, YFINANCE RVOL SCANNER & SMARTAPI FETCHER
 # ==============================================================================
 def load_token_map() -> pd.DataFrame:
     urls = [
@@ -132,14 +145,64 @@ def build_nse_fno_universe(scrip_df: pd.DataFrame) -> list:
 
     universe = []
     for sym in fno_names:
-        if sym in ("IDEA",):
+        # v7 Fix: Exclude illiquid IDEA and NSE mock/test tickers (e.g., 011NSETEST..181NSETEST)
+        if sym in ("IDEA",) or "NSETEST" in sym.upper():
             continue
         tok = eq_token_map.get(f"{sym}-EQ")
         if tok:
             universe.append({"symbol": sym, "exchange": "NSE", "token": tok})
 
-    print(f"Auto-discovered {len(universe)} active NSE F&O cash equities (Full A-Z).")
+    print(f"Auto-discovered {len(universe)} active NSE F&O cash equities (Full A-Z, NSETEST filtered).")
     return universe
+
+
+def fetch_nifty_5m_today(today_str: str) -> tuple:
+    """
+    Fetches Nifty 50 (^NSEI) 5m bars via yfinance for intraday regime gating.
+    Returns (nifty_today_df, regime_summary_str).
+    """
+    start_dt = (datetime.now(IST) - timedelta(days=NIFTY_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    try:
+        raw = yf.download("^NSEI", start=start_dt, interval="5m", auto_adjust=False, progress=False)
+        if raw is None or raw.empty:
+            return pd.DataFrame(), "Unavailable (unfiltered fallback)"
+
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+
+        df = raw[["Open", "High", "Low", "Close"]].dropna().copy()
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC").tz_convert("Asia/Kolkata")
+        else:
+            df.index = df.index.tz_convert("Asia/Kolkata")
+
+        df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
+        df["Date_str"] = df.index.strftime("%Y-%m-%d")
+        df["Time_str"] = df.index.strftime("%H:%M")
+        df["Day_Open"] = df.groupby("Date_str")["Open"].transform("first")
+        df["Nifty_Bull"] = (df["Close"] > df["EMA20"]) & (df["Close"] > df["Day_Open"])
+        df["Nifty_Bear"] = (df["Close"] < df["EMA20"]) & (df["Close"] < df["Day_Open"])
+
+        today_df = df[df["Date_str"] == today_str].copy()
+        if today_df.empty:
+            return pd.DataFrame(), "No intraday Nifty bars for today"
+
+        prime_df = today_df[(today_df["Time_str"] >= "09:30") & (today_df["Time_str"] <= ENTRY_CUTOFF_TIME)]
+        if prime_df.empty:
+            return today_df, "Pre-09:30 (awaiting prime window)"
+
+        bull_n = int(prime_df["Nifty_Bull"].sum())
+        bear_n = int(prime_df["Nifty_Bear"].sum())
+        tot_n = len(prime_df)
+        neut_n = tot_n - bull_n - bear_n
+        last_row = prime_df.iloc[-1]
+        last_tag = "BULL" if bool(last_row["Nifty_Bull"]) else ("BEAR" if bool(last_row["Nifty_Bear"]) else "NEUTRAL")
+        summary = f"Prime 09:30-{ENTRY_CUTOFF_TIME} -> Bull {bull_n}/{tot_n}, Bear {bear_n}/{tot_n}, Neut {neut_n}/{tot_n} (Last: {last_tag})"
+        print(f"Nifty 5m Regime ({today_str}): {summary}")
+        return today_df, summary
+    except Exception as e:
+        print(f"[Warn] Nifty 5m fetch failed: {e}")
+        return pd.DataFrame(), "Unavailable (unfiltered fallback)"
 
 
 def compute_today_rvol(df: pd.DataFrame, today_str: str) -> tuple:
@@ -298,7 +361,7 @@ def fetch_5m_candles_single(smart_api: SmartConnect, exchange: str, token: str, 
 
 
 # ==============================================================================
-# 4. ORVWB v6 (ENGINE A ONLY) TODAY SIMULATOR
+# 4. ORVWB v7 (ENGINE A + PRIME 10:15 + NIFTY 5M REGIME) TODAY SIMULATOR
 # ==============================================================================
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -319,7 +382,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def simulate_today_orvwb(df: pd.DataFrame, symbol: str, exchange: str, today_str: str, rvol_val: float) -> list:
+def simulate_today_orvwb(
+    df: pd.DataFrame,
+    nifty_day: pd.DataFrame,
+    symbol: str,
+    exchange: str,
+    today_str: str,
+    rvol_val: float,
+) -> list:
     df = compute_indicators(df)
     day_df = df[df.index.strftime("%Y-%m-%d") == today_str]
     if day_df.empty:
@@ -404,13 +474,22 @@ def simulate_today_orvwb(df: pd.DataFrame, symbol: str, exchange: str, today_str
                 move = (c - entry_price) if pos == 1 else (entry_price - c)
                 realized_r += rem_weight * (move / init_risk)
                 exit_price = c
-                exit_reason = "15:15 EOD Square-Off"
+                exit_reason = "TP1 + 15:15 EOD" if tp1_hit else "15:15 EOD Square-Off"
                 pos = 0
                 break
 
-        if pos == 0 and entry_time is None and t_str <= "11:10":
+        # v7 Upgrade: Prime 09:30-10:15 entry window + Nifty 5m Regime alignment
+        if pos == 0 and entry_time is None and t_str <= ENTRY_CUTOFF_TIME:
             if c < MIN_SHARE_PRICE:
                 continue
+
+            n_bull = True
+            n_bear = True
+            if USE_NIFTY_REGIME and nifty_day is not None and not nifty_day.empty:
+                n_prior = nifty_day[nifty_day["Time_str"] <= t_str]
+                if not n_prior.empty:
+                    n_bull = bool(n_prior["Nifty_Bull"].iloc[-1])
+                    n_bear = bool(n_prior["Nifty_Bear"].iloc[-1])
 
             bar_range = max(h - l, 0.05)
             body_pct = abs(c - o) / bar_range
@@ -423,10 +502,12 @@ def simulate_today_orvwb(df: pd.DataFrame, symbol: str, exchange: str, today_str
             long_sig = (
                 or_valid and has_vol and strong_body and bull_top
                 and (c > or_high) and (c > vwap) and (c > ema20)
+                and n_bull
             )
             short_sig = (
                 or_valid and has_vol and strong_body and bear_bot
                 and (c < or_low) and (c < vwap) and (c < ema20)
+                and n_bear
             )
 
             if long_sig:
@@ -460,15 +541,15 @@ def simulate_today_orvwb(df: pd.DataFrame, symbol: str, exchange: str, today_str
     side_str = "LONG" if (tp2_price > entry_price) else "SHORT"
     per_share_gross = realized_r * init_risk
     base_pnl = compute_real_trade_pnl(
-        entry_price, per_share_gross, side_str, exchange, exit_reason, CAPITAL_PER_TRADE
+        entry_price, per_share_gross, side_str, exchange, exit_reason, CAPITAL_PER_TRADE, tp1_hit=tp1_hit
     )
     pnl_50k = compute_real_trade_pnl(
-        entry_price, per_share_gross, side_str, exchange, exit_reason, LIVE_START_CAPITAL_1X
+        entry_price, per_share_gross, side_str, exchange, exit_reason, LIVE_START_CAPITAL_1X, tp1_hit=tp1_hit
     )
     return [{
         "Date": today_str,
         "Ticker": f"{symbol}.{exchange}",
-        "Engine": "Engine A (Top9 RVOL)",
+        "Engine": "Engine A v7 (Top9+Nifty+1015)",
         "Side": side_str,
         "Entry_Time": entry_time,
         "RVOL_0930": rvol_val,
@@ -482,6 +563,7 @@ def simulate_today_orvwb(df: pd.DataFrame, symbol: str, exchange: str, today_str
         "Net_PnL_50k_1x": pnl_50k,
         "Net_PnL_Max1_50k": pnl_50k,
         "Status": exit_reason,
+        "_tp1_hit": tp1_hit,
     }]
 
 
@@ -541,16 +623,17 @@ def update_ledger_with_today(today_trades: list, today_str: str) -> tuple:
     for idx, r in today_df.iterrows():
         exch = "BSE" if ".BSE" in str(r["Ticker"]) else "NSE"
         cap = CONVICTION_CAP_MAP[scores[idx]]
+        tp1_flag = bool(r.get("_tp1_hit", False))
         net_adap.append(
             compute_real_trade_pnl(
                 float(r["Entry_Price"]), float(per_share_gross.loc[idx]),
-                str(r["Side"]), exch, str(r["Status"]), cap,
+                str(r["Side"]), exch, str(r["Status"]), cap, tp1_hit=tp1_flag,
             )
         )
         net_50k.append(
             compute_real_trade_pnl(
                 float(r["Entry_Price"]), float(per_share_gross.loc[idx]),
-                str(r["Side"]), exch, str(r["Status"]), LIVE_START_CAPITAL_1X,
+                str(r["Side"]), exch, str(r["Status"]), LIVE_START_CAPITAL_1X, tp1_hit=tp1_flag,
             )
         )
 
@@ -564,7 +647,7 @@ def update_ledger_with_today(today_trades: list, today_str: str) -> tuple:
     today_df["Net_PnL_Max1_50k"] = np.where(
         np.arange(len(today_df)) < MAX_DAILY_TRADES_CAP, today_df["Net_PnL_50k_1x"], 0.0
     ).round(2)
-    today_df = today_df.drop(columns=["_Tier_P", "_RVOL_D"])
+    today_df = today_df.drop(columns=["_Tier_P", "_RVOL_D", "_tp1_hit"], errors="ignore")
 
     combined_df = pd.concat([kept_old, today_df], ignore_index=True)
     combined_df.to_csv(LEDGER_FILE, index=False)
@@ -606,12 +689,14 @@ def send_telegram_summary(
     today_str: str,
     scanned_cnt: int,
     qualified_cnt: int,
+    nifty_summary: str,
     top9_list: list,
     today_df: pd.DataFrame,
     combined_df: pd.DataFrame,
 ):
-    lines = [f"📊 *ORVWB v6 Hybrid Auto-F&O → Top {TOP_N_RVOL} RVOL ({today_str})*"]
+    lines = [f"📊 *ORVWB v7 Hybrid Top-{TOP_N_RVOL} RVOL + Nifty Regime + ≤{ENTRY_CUTOFF_TIME} ({today_str})*"]
     lines.append(f"_(Scanned {scanned_cnt} NSE F&O | {qualified_cnt} ≥ {MIN_RVOL_0930}x RVOL | SmartAPI Top-{TOP_N_RVOL} Fills)_")
+    lines.append(f"• *Nifty 5m Regime:* {nifty_summary}")
 
     if top9_list:
         top_str = ", ".join(f"{x['symbol']} ({x['rvol']:.2f}x)" for x in top9_list)
@@ -620,7 +705,10 @@ def send_telegram_summary(
         lines.append("• *Today's Basket:* No stocks qualified (market holiday or no intraday bars yet).")
 
     if today_df.empty:
-        lines.append(f"• *Today's Action:* No ORVWB setups triggered among today's Top {TOP_N_RVOL} RVOL stocks.")
+        lines.append(
+            f"• *Today's Action:* No ORVWB v7 setups triggered before {ENTRY_CUTOFF_TIME} "
+            f"aligned with Nifty 5m regime."
+        )
     else:
         for slot_idx, (_, r) in enumerate(today_df.iterrows(), start=1):
             tier_str = r.get("Conviction", "Tier A")
@@ -661,10 +749,13 @@ def send_telegram_summary(
 
 def main():
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    print(f"=== ORVWB v6 Hybrid Auto-F&O -> Top {TOP_N_RVOL} RVOL Bot ({today_str}) ===")
+    print(f"=== ORVWB v7 Hybrid Top-{TOP_N_RVOL} RVOL + Nifty Regime + <={ENTRY_CUTOFF_TIME} ({today_str}) ===")
 
     scrip_df = load_token_map()
     universe = build_nse_fno_universe(scrip_df)
+
+    # Fetch Nifty 5m regime for today before simulating entries
+    nifty_day, nifty_summary = fetch_nifty_5m_today(today_str)
 
     # Stage 1: Full A-Z RVOL scan via yfinance (~25s, zero SmartAPI rate limits)
     qualified, scanned_cnt = scan_rvol_yfinance(universe, today_str)
@@ -683,11 +774,11 @@ def main():
             if candles.empty:
                 print(f"  [Warn] No SmartAPI candles returned for {q['symbol']}.NSE; skipping.")
                 continue
-            t_list = simulate_today_orvwb(candles, q["symbol"], q["exchange"], today_str, q["rvol"])
+            t_list = simulate_today_orvwb(candles, nifty_day, q["symbol"], q["exchange"], today_str, q["rvol"])
             today_trades.extend(t_list)
 
     today_df, combined_df = update_ledger_with_today(today_trades, today_str)
-    send_telegram_summary(today_str, scanned_cnt, len(qualified), top9, today_df, combined_df)
+    send_telegram_summary(today_str, scanned_cnt, len(qualified), nifty_summary, top9, today_df, combined_df)
     print(f"Done. Today's setups: {len(today_trades)} | Ledger rows: {len(combined_df)}")
 
 
